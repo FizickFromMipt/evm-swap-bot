@@ -7,606 +7,411 @@ jest.mock('../src/logger', () => ({
   sep: jest.fn(),
 }));
 
-jest.mock('../src/retry', () => ({
-  withRetry: jest.fn((fn) => fn()),
-}));
+const { ethers } = require('ethers');
 
-jest.mock('../src/http', () => ({
-  client: {
-    get: jest.fn(),
-  },
-}));
+const TOKEN_ADDR = '0x1234567890abcdef1234567890abcdef12345678';
+const ROUTER_ADDR = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+const AMOUNT_WEI = 10_000_000_000_000_000n; // 0.01 BNB
 
-const { PublicKey } = require('@solana/web3.js');
-const {
-  parseToken2022Extensions,
-  checkTransferFee,
-  checkPermanentDelegate,
-  checkNonTransferable,
-  checkTransferHook,
-  checkHoneypot,
-  runAntiScamChecks,
-} = require('../src/antiscam');
-const { client } = require('../src/http');
+// === checkProxy ===
 
-// ============= Helpers =============
+describe('checkProxy', () => {
+  const { checkProxy } = require('../src/antiscam');
 
-/**
- * Build a Token-2022 mint buffer with extensions.
- * 82 bytes base mint + 1 byte account type (2) + TLV extensions.
- */
-function buildToken2022Buffer(extensions = []) {
-  // Calculate total size
-  let extSize = 0;
-  for (const ext of extensions) {
-    extSize += 4 + ext.data.length; // 2 bytes type + 2 bytes length + data
-  }
+  test('returns isProxy:true when implementation slot is set', async () => {
+    const implAddr = '0x000000000000000000000000' + '1234567890abcdef1234567890abcdef12345678';
+    const provider = {
+      getStorage: jest.fn().mockResolvedValue(implAddr),
+    };
 
-  const buf = Buffer.alloc(83 + extSize, 0);
-
-  // Minimal valid mint data (82 bytes)
-  buf.writeBigUInt64LE(1_000_000_000n, 36); // supply
-  buf[44] = 9; // decimals
-  buf[45] = 1; // isInitialized
-
-  // Account type at byte 82 = 2 (Mint)
-  buf[82] = 2;
-
-  // Write TLV extensions
-  let offset = 83;
-  for (const ext of extensions) {
-    buf.writeUInt16LE(ext.type, offset);
-    buf.writeUInt16LE(ext.data.length, offset + 2);
-    ext.data.copy(buf, offset + 4);
-    offset += 4 + ext.data.length;
-  }
-
-  return buf;
-}
-
-/**
- * Build TransferFeeConfig extension data (108 bytes).
- */
-function buildTransferFeeData({ feeBps = 0, maxFee = 0n } = {}) {
-  const data = Buffer.alloc(108, 0);
-  // newerTransferFee.maxFee at offset 98 (u64 LE)
-  data.writeBigUInt64LE(maxFee, 98);
-  // newerTransferFee.transfer_fee_basis_points at offset 106 (u16 LE)
-  data.writeUInt16LE(feeBps, 106);
-  return data;
-}
-
-/**
- * Build PermanentDelegate extension data (32 bytes).
- */
-function buildPermanentDelegateData(pubkeyBase58) {
-  const data = Buffer.alloc(32, 0);
-  new PublicKey(pubkeyBase58).toBuffer().copy(data, 0);
-  return data;
-}
-
-/**
- * Build TransferHook extension data (32 bytes).
- */
-function buildTransferHookData(programIdBase58) {
-  const data = Buffer.alloc(32, 0);
-  new PublicKey(programIdBase58).toBuffer().copy(data, 0);
-  return data;
-}
-
-const SOME_PUBKEY = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'; // USDC mint (valid pubkey)
-
-// ============= parseToken2022Extensions =============
-
-describe('parseToken2022Extensions', () => {
-  test('returns empty array for null data', () => {
-    expect(parseToken2022Extensions(null)).toEqual([]);
+    const result = await checkProxy(provider, TOKEN_ADDR);
+    expect(result.isProxy).toBe(true);
+    expect(result.implementation).toBeDefined();
   });
 
-  test('returns empty array for data <= 83 bytes', () => {
-    expect(parseToken2022Extensions(Buffer.alloc(83))).toEqual([]);
+  test('returns isProxy:false when implementation slot is zero', async () => {
+    const provider = {
+      getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)),
+    };
+
+    const result = await checkProxy(provider, TOKEN_ADDR);
+    expect(result.isProxy).toBe(false);
   });
 
-  test('returns empty array if byte 82 is not 2', () => {
-    const buf = Buffer.alloc(100, 0);
-    buf[82] = 1; // Not a Mint account type
-    expect(parseToken2022Extensions(buf)).toEqual([]);
-  });
+  test('returns isProxy:false on error', async () => {
+    const provider = {
+      getStorage: jest.fn().mockRejectedValue(new Error('RPC error')),
+    };
 
-  test('parses single extension', () => {
-    const extData = Buffer.alloc(10, 0xAB);
-    const buf = buildToken2022Buffer([{ type: 5, data: extData }]);
-    const extensions = parseToken2022Extensions(buf);
-
-    expect(extensions).toHaveLength(1);
-    expect(extensions[0].type).toBe(5);
-    expect(extensions[0].data.length).toBe(10);
-  });
-
-  test('parses multiple extensions', () => {
-    const ext1Data = Buffer.alloc(8, 0x01);
-    const ext2Data = Buffer.alloc(32, 0x02);
-    const buf = buildToken2022Buffer([
-      { type: 1, data: ext1Data },
-      { type: 9, data: ext2Data },
-    ]);
-    const extensions = parseToken2022Extensions(buf);
-
-    expect(extensions).toHaveLength(2);
-    expect(extensions[0].type).toBe(1);
-    expect(extensions[1].type).toBe(9);
-  });
-
-  test('stops parsing on truncated extension', () => {
-    // Build buffer with one valid extension, then truncate
-    const extData = Buffer.alloc(10, 0xAB);
-    const buf = buildToken2022Buffer([{ type: 5, data: extData }]);
-    // Manually add a partial TLV header that claims more data than available
-    const truncated = Buffer.alloc(buf.length + 4, 0);
-    buf.copy(truncated);
-    truncated.writeUInt16LE(99, buf.length);     // type
-    truncated.writeUInt16LE(1000, buf.length + 2); // length > remaining
-    const extensions = parseToken2022Extensions(truncated);
-
-    // Should still parse the first extension, but stop at the truncated one
-    expect(extensions).toHaveLength(1);
+    const result = await checkProxy(provider, TOKEN_ADDR);
+    expect(result.isProxy).toBe(false);
   });
 });
 
-// ============= checkTransferFee =============
+// === checkOwnership ===
 
-describe('checkTransferFee', () => {
-  test('returns null when no TransferFeeConfig extension', () => {
-    expect(checkTransferFee([])).toBeNull();
-  });
-
-  test('returns null when extension data too short', () => {
-    const extensions = [{ type: 1, data: Buffer.alloc(50) }];
-    expect(checkTransferFee(extensions)).toBeNull();
-  });
-
-  test('detects non-zero transfer fee', () => {
-    const data = buildTransferFeeData({ feeBps: 500, maxFee: 1000000n });
-    const extensions = [{ type: 1, data }];
-    const result = checkTransferFee(extensions);
-
-    expect(result).not.toBeNull();
-    expect(result.hasTransferFee).toBe(true);
-    expect(result.feeBps).toBe(500);
-    expect(result.maxFee).toBe('1000000');
-  });
-
-  test('returns hasTransferFee:false when fee is 0', () => {
-    const data = buildTransferFeeData({ feeBps: 0 });
-    const extensions = [{ type: 1, data }];
-    const result = checkTransferFee(extensions);
-
-    expect(result).not.toBeNull();
-    expect(result.hasTransferFee).toBe(false);
-    expect(result.feeBps).toBe(0);
-  });
-});
-
-// ============= checkPermanentDelegate =============
-
-describe('checkPermanentDelegate', () => {
-  test('returns null when no PermanentDelegate extension', () => {
-    expect(checkPermanentDelegate([])).toBeNull();
-  });
-
-  test('returns null when extension data too short', () => {
-    const extensions = [{ type: 12, data: Buffer.alloc(16) }];
-    expect(checkPermanentDelegate(extensions)).toBeNull();
-  });
-
-  test('returns null when delegate is default (zero) pubkey', () => {
-    const data = buildPermanentDelegateData(PublicKey.default.toBase58());
-    const extensions = [{ type: 12, data }];
-    expect(checkPermanentDelegate(extensions)).toBeNull();
-  });
-
-  test('detects active permanent delegate', () => {
-    const data = buildPermanentDelegateData(SOME_PUBKEY);
-    const extensions = [{ type: 12, data }];
-    const result = checkPermanentDelegate(extensions);
-
-    expect(result).not.toBeNull();
-    expect(result.hasPermanentDelegate).toBe(true);
-    expect(result.delegate).toBe(SOME_PUBKEY);
-  });
-});
-
-// ============= checkNonTransferable =============
-
-describe('checkNonTransferable', () => {
-  test('returns false when no NonTransferable extension', () => {
-    expect(checkNonTransferable([])).toBe(false);
-  });
-
-  test('returns true when NonTransferable extension present', () => {
-    const extensions = [{ type: 9, data: Buffer.alloc(0) }];
-    expect(checkNonTransferable(extensions)).toBe(true);
-  });
-
-  test('returns true even among other extensions', () => {
-    const extensions = [
-      { type: 1, data: Buffer.alloc(108) },
-      { type: 9, data: Buffer.alloc(0) },
-      { type: 14, data: Buffer.alloc(32) },
-    ];
-    expect(checkNonTransferable(extensions)).toBe(true);
-  });
-});
-
-// ============= checkTransferHook =============
-
-describe('checkTransferHook', () => {
-  test('returns null when no TransferHook extension', () => {
-    expect(checkTransferHook([])).toBeNull();
-  });
-
-  test('returns null when extension data too short', () => {
-    const extensions = [{ type: 14, data: Buffer.alloc(16) }];
-    expect(checkTransferHook(extensions)).toBeNull();
-  });
-
-  test('returns null when programId is default pubkey', () => {
-    const data = buildTransferHookData(PublicKey.default.toBase58());
-    const extensions = [{ type: 14, data }];
-    expect(checkTransferHook(extensions)).toBeNull();
-  });
-
-  test('detects active transfer hook', () => {
-    const data = buildTransferHookData(SOME_PUBKEY);
-    const extensions = [{ type: 14, data }];
-    const result = checkTransferHook(extensions);
-
-    expect(result).not.toBeNull();
-    expect(result.hasTransferHook).toBe(true);
-    expect(result.programId).toBe(SOME_PUBKEY);
-  });
-});
-
-// ============= checkHoneypot =============
-
-describe('checkHoneypot', () => {
-  const config = {
-    jupiterApi: { quote: 'https://quote-api.jup.ag/v6/quote' },
-    solMint: 'So11111111111111111111111111111111111111112',
-    slippageBps: 500,
-    amountLamports: 10_000_000,
-  };
-  const buyQuote = { outAmount: '50000000' };
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
-  test('returns canSell:true with low round-trip loss', async () => {
-    client.get.mockResolvedValue({
-      data: { outAmount: '9500000', priceImpactPct: '0.5' },
+describe('checkOwnership', () => {
+  test('returns renounced:true when owner() reverts', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    jest.doMock('ethers', () => {
+      const actual = jest.requireActual('ethers');
+      return {
+        ...actual,
+        ethers: {
+          ...actual.ethers,
+          Contract: jest.fn().mockReturnValue({
+            owner: jest.fn().mockRejectedValue(new Error('revert')),
+          }),
+        },
+      };
     });
 
-    const result = await checkHoneypot(config, 'TokenMint123', buyQuote);
+    const { checkOwnership } = require('../src/antiscam');
+    const result = await checkOwnership({}, TOKEN_ADDR);
+    expect(result.hasOwner).toBe(false);
+    expect(result.renounced).toBe(true);
+    expect(result.owner).toBeNull();
 
+    jest.restoreAllMocks();
+  });
+
+  test('returns hasOwner:true when owner is set', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    jest.doMock('ethers', () => {
+      const actual = jest.requireActual('ethers');
+      return {
+        ...actual,
+        ethers: {
+          ...actual.ethers,
+          Contract: jest.fn().mockReturnValue({
+            owner: jest.fn().mockResolvedValue('0x1234567890AbcdEF1234567890aBcdef12345678'),
+          }),
+          ZeroAddress: actual.ethers.ZeroAddress,
+        },
+      };
+    });
+
+    const { checkOwnership } = require('../src/antiscam');
+    const result = await checkOwnership({}, TOKEN_ADDR);
+    expect(result.hasOwner).toBe(true);
+    expect(result.renounced).toBe(false);
+
+    jest.restoreAllMocks();
+  });
+
+  test('returns renounced:true when owner is zero address', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    const actualEthers = jest.requireActual('ethers');
+    jest.doMock('ethers', () => ({
+      ...actualEthers,
+      ethers: {
+        ...actualEthers.ethers,
+        Contract: jest.fn().mockReturnValue({
+          owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress),
+        }),
+        ZeroAddress: actualEthers.ethers.ZeroAddress,
+      },
+    }));
+
+    const { checkOwnership } = require('../src/antiscam');
+    const result = await checkOwnership({}, TOKEN_ADDR);
+    expect(result.hasOwner).toBe(false);
+    expect(result.renounced).toBe(true);
+
+    jest.restoreAllMocks();
+  });
+});
+
+// === checkHoneypot ===
+
+describe('checkHoneypot', () => {
+  test('returns canSell:true with low round-trip loss', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    jest.doMock('ethers', () => {
+      const actual = jest.requireActual('ethers');
+      return {
+        ...actual,
+        ethers: {
+          ...actual.ethers,
+          Contract: jest.fn().mockReturnValue({
+            getAmountsOut: jest.fn()
+              .mockResolvedValueOnce([AMOUNT_WEI, 1000000n]) // buy
+              .mockResolvedValueOnce([1000000n, 9500000000000000n]), // sell (95% return)
+          }),
+        },
+      };
+    });
+
+    const { checkHoneypot } = require('../src/antiscam');
+    const result = await checkHoneypot({}, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI);
     expect(result.canSell).toBe(true);
-    expect(result.sellOutAmount).toBe('9500000');
     expect(result.roundTripLossPct).toBe(5);
     expect(result.warning).toBeUndefined();
+
+    jest.restoreAllMocks();
   });
 
   test('returns warning for >20% round-trip loss', async () => {
-    client.get.mockResolvedValue({
-      data: { outAmount: '7000000' },
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    jest.doMock('ethers', () => {
+      const actual = jest.requireActual('ethers');
+      return {
+        ...actual,
+        ethers: {
+          ...actual.ethers,
+          Contract: jest.fn().mockReturnValue({
+            getAmountsOut: jest.fn()
+              .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
+              .mockResolvedValueOnce([1000000n, 7000000000000000n]), // 70% return = 30% loss
+          }),
+        },
+      };
     });
 
-    const result = await checkHoneypot(config, 'TokenMint123', buyQuote);
-
+    const { checkHoneypot } = require('../src/antiscam');
+    const result = await checkHoneypot({}, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI);
     expect(result.canSell).toBe(true);
     expect(result.roundTripLossPct).toBe(30);
     expect(result.warning).toContain('High round-trip loss');
+
+    jest.restoreAllMocks();
   });
 
-  test('returns extreme warning for >50% round-trip loss', async () => {
-    client.get.mockResolvedValue({
-      data: { outAmount: '3000000' },
+  test('returns canSell:false when sell quote fails', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    jest.doMock('ethers', () => {
+      const actual = jest.requireActual('ethers');
+      return {
+        ...actual,
+        ethers: {
+          ...actual.ethers,
+          Contract: jest.fn().mockReturnValue({
+            getAmountsOut: jest.fn()
+              .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
+              .mockRejectedValueOnce(new Error('INSUFFICIENT')),
+          }),
+        },
+      };
     });
 
-    const result = await checkHoneypot(config, 'TokenMint123', buyQuote);
-
-    expect(result.canSell).toBe(true);
-    expect(result.roundTripLossPct).toBe(70);
-    expect(result.warning).toContain('Extreme round-trip loss');
-  });
-
-  test('returns canSell:false when no sell route found', async () => {
-    client.get.mockResolvedValue({ data: {} });
-
-    const result = await checkHoneypot(config, 'TokenMint123', buyQuote);
-
+    const { checkHoneypot } = require('../src/antiscam');
+    const result = await checkHoneypot({}, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI);
     expect(result.canSell).toBe(false);
     expect(result.reason).toContain('honeypot');
-  });
 
-  test('returns canSell:false on API error', async () => {
-    client.get.mockRejectedValue(new Error('Network error'));
-
-    const result = await checkHoneypot(config, 'TokenMint123', buyQuote);
-
-    expect(result.canSell).toBe(false);
-    expect(result.reason).toContain('Sell simulation failed');
-    expect(result.reason).toContain('Network error');
-  });
-
-  test('passes correct params to Jupiter API', async () => {
-    client.get.mockResolvedValue({
-      data: { outAmount: '9500000' },
-    });
-
-    await checkHoneypot(config, 'MyTokenMint', buyQuote);
-
-    expect(client.get).toHaveBeenCalledWith(
-      config.jupiterApi.quote,
-      expect.objectContaining({
-        params: {
-          inputMint: 'MyTokenMint',
-          outputMint: config.solMint,
-          amount: '50000000',
-          slippageBps: 500,
-        },
-      })
-    );
+    jest.restoreAllMocks();
   });
 });
 
-// ============= runAntiScamChecks =============
+// === runAntiScamChecks ===
 
 describe('runAntiScamChecks', () => {
-  const config = {
-    jupiterApi: { quote: 'https://quote-api.jup.ag/v6/quote' },
-    solMint: 'So11111111111111111111111111111111111111112',
-    slippageBps: 500,
-    amountLamports: 10_000_000,
-  };
+  test('returns low risk for clean token', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    const actualEthers = jest.requireActual('ethers');
+    jest.doMock('ethers', () => ({
+      ...actualEthers,
+      ethers: {
+        ...actualEthers.ethers,
+        Contract: jest.fn().mockImplementation((addr, abi) => {
+          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
+            return {
+              getAmountsOut: jest.fn()
+                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
+                .mockResolvedValueOnce([1000000n, 9500000000000000n]),
+            };
+          }
+          return { owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress) };
+        }),
+        ZeroAddress: actualEthers.ethers.ZeroAddress,
+        getAddress: actualEthers.ethers.getAddress,
+      },
+    }));
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
+    const { runAntiScamChecks } = require('../src/antiscam');
+    const provider = { getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)) };
+    const tokenInfo = { totalSupply: 1000000n };
 
-  test('returns low risk for clean SPL token (no Token-2022)', async () => {
-    const tokenInfo = {
-      isToken2022: false,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
-
-    // Mock honeypot check: token is sellable with low loss
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
-
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
+    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
     expect(result.riskLevel).toBe('low');
     expect(result.warnings).toHaveLength(0);
+
+    jest.restoreAllMocks();
   });
 
-  test('returns medium risk for mint authority only', async () => {
-    const tokenInfo = {
-      isToken2022: false,
-      hasFreezeAuthority: false,
-      hasMintAuthority: true,
-      supply: '1000000000',
-    };
+  test('returns critical risk for honeypot', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    const actualEthers = jest.requireActual('ethers');
+    jest.doMock('ethers', () => ({
+      ...actualEthers,
+      ethers: {
+        ...actualEthers.ethers,
+        Contract: jest.fn().mockImplementation((addr, abi) => {
+          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
+            return {
+              getAmountsOut: jest.fn()
+                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
+                .mockRejectedValueOnce(new Error('INSUFFICIENT')),
+            };
+          }
+          return { owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress) };
+        }),
+        ZeroAddress: actualEthers.ethers.ZeroAddress,
+        getAddress: actualEthers.ethers.getAddress,
+      },
+    }));
 
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
+    const { runAntiScamChecks } = require('../src/antiscam');
+    const provider = { getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)) };
+    const tokenInfo = { totalSupply: 1000000n };
 
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
-    expect(result.riskLevel).toBe('medium');
-    expect(result.warnings).toHaveLength(1);
-    expect(result.warnings[0]).toContain('Mint authority');
-  });
-
-  test('returns high risk for freeze authority', async () => {
-    const tokenInfo = {
-      isToken2022: false,
-      hasFreezeAuthority: true,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
-
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
-
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
-    expect(result.riskLevel).toBe('high');
-    expect(result.warnings.some((w) => w.includes('Freeze authority'))).toBe(true);
-  });
-
-  test('returns critical risk for honeypot (can\'t sell)', async () => {
-    const tokenInfo = {
-      isToken2022: false,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
-
-    client.get.mockResolvedValue({ data: {} });
-
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
+    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
     expect(result.riskLevel).toBe('critical');
     expect(result.warnings.some((w) => w.includes('HONEYPOT'))).toBe(true);
+
+    jest.restoreAllMocks();
   });
 
-  test('returns critical risk for non-transferable Token-2022', async () => {
-    const rawData = buildToken2022Buffer([{ type: 9, data: Buffer.alloc(0) }]);
-    const tokenInfo = {
-      isToken2022: true,
-      _rawData: rawData,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
+  test('returns high risk for upgradeable proxy', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    const actualEthers = jest.requireActual('ethers');
+    jest.doMock('ethers', () => ({
+      ...actualEthers,
+      ethers: {
+        ...actualEthers.ethers,
+        Contract: jest.fn().mockImplementation((addr, abi) => {
+          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
+            return {
+              getAmountsOut: jest.fn()
+                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
+                .mockResolvedValueOnce([1000000n, 9500000000000000n]),
+            };
+          }
+          return { owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress) };
+        }),
+        ZeroAddress: actualEthers.ethers.ZeroAddress,
+        getAddress: actualEthers.ethers.getAddress,
+      },
+    }));
 
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
+    const { runAntiScamChecks } = require('../src/antiscam');
+    const implAddr = '0x000000000000000000000000' + '1234567890abcdef1234567890abcdef12345678';
+    const provider = { getStorage: jest.fn().mockResolvedValue(implAddr) };
+    const tokenInfo = { totalSupply: 1000000n };
 
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
-    expect(result.riskLevel).toBe('critical');
-    expect(result.warnings.some((w) => w.includes('NON-TRANSFERABLE'))).toBe(true);
-    expect(result.details.nonTransferable).toBe(true);
-  });
-
-  test('returns critical risk for permanent delegate Token-2022', async () => {
-    const delegateData = buildPermanentDelegateData(SOME_PUBKEY);
-    const rawData = buildToken2022Buffer([{ type: 12, data: delegateData }]);
-    const tokenInfo = {
-      isToken2022: true,
-      _rawData: rawData,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
-
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
-
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
-    expect(result.riskLevel).toBe('critical');
-    expect(result.warnings.some((w) => w.includes('Permanent delegate'))).toBe(true);
-    expect(result.details.permanentDelegate.delegate).toBe(SOME_PUBKEY);
-  });
-
-  test('detects extreme transfer fee on Token-2022', async () => {
-    const feeData = buildTransferFeeData({ feeBps: 5000, maxFee: 0n });
-    const rawData = buildToken2022Buffer([{ type: 1, data: feeData }]);
-    const tokenInfo = {
-      isToken2022: true,
-      _rawData: rawData,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
-
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
-
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
-    expect(result.riskLevel).toBe('critical');
-    expect(result.warnings.some((w) => w.includes('EXTREME transfer fee'))).toBe(true);
-    expect(result.details.transferFee.feeBps).toBe(5000);
-  });
-
-  test('detects transfer hook on Token-2022', async () => {
-    const hookData = buildTransferHookData(SOME_PUBKEY);
-    const rawData = buildToken2022Buffer([{ type: 14, data: hookData }]);
-    const tokenInfo = {
-      isToken2022: true,
-      _rawData: rawData,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
-
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
-
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
+    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
     expect(result.riskLevel).toBe('high');
-    expect(result.warnings.some((w) => w.includes('Transfer hook'))).toBe(true);
-    expect(result.details.transferHook.programId).toBe(SOME_PUBKEY);
+    expect(result.warnings.some((w) => w.includes('upgradeable proxy'))).toBe(true);
+
+    jest.restoreAllMocks();
   });
 
-  test('skips honeypot check when buyQuote is null', async () => {
-    const tokenInfo = {
-      isToken2022: false,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
+  test('returns medium risk for non-renounced ownership', async () => {
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    const actualEthers = jest.requireActual('ethers');
+    jest.doMock('ethers', () => ({
+      ...actualEthers,
+      ethers: {
+        ...actualEthers.ethers,
+        Contract: jest.fn().mockImplementation((addr, abi) => {
+          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
+            return {
+              getAmountsOut: jest.fn()
+                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
+                .mockResolvedValueOnce([1000000n, 9500000000000000n]),
+            };
+          }
+          return { owner: jest.fn().mockResolvedValue('0x1234567890AbcdEF1234567890aBcdef12345678') };
+        }),
+        ZeroAddress: actualEthers.ethers.ZeroAddress,
+        getAddress: actualEthers.ethers.getAddress,
+      },
+    }));
 
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, null);
+    const { runAntiScamChecks } = require('../src/antiscam');
+    const provider = { getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)) };
+    const tokenInfo = { totalSupply: 1000000n };
 
-    expect(result.riskLevel).toBe('low');
-    expect(result.details.honeypot).toBeUndefined();
-    expect(client.get).not.toHaveBeenCalled();
-  });
+    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
+    expect(result.riskLevel).toBe('medium');
+    expect(result.warnings.some((w) => w.includes('Ownership NOT renounced'))).toBe(true);
 
-  test('accumulates multiple Token-2022 warnings', async () => {
-    const feeData = buildTransferFeeData({ feeBps: 200 });
-    const hookData = buildTransferHookData(SOME_PUBKEY);
-    const rawData = buildToken2022Buffer([
-      { type: 1, data: feeData },
-      { type: 14, data: hookData },
-    ]);
-    const tokenInfo = {
-      isToken2022: true,
-      _rawData: rawData,
-      hasFreezeAuthority: true,
-      hasMintAuthority: true,
-      supply: '1000000000',
-    };
-
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
-
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
-    // Transfer fee (200 bps) + transfer hook + freeze authority + mint authority = 4 warnings
-    expect(result.warnings.length).toBeGreaterThanOrEqual(4);
-    expect(result.riskLevel).toBe('high'); // Transfer hook and freeze authority → high
-  });
-
-  test('skips Token-2022 checks for non-Token-2022 tokens', async () => {
-    const tokenInfo = {
-      isToken2022: false,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '1000000000',
-    };
-
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
-
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
-    expect(result.details.transferFee).toBeUndefined();
-    expect(result.details.permanentDelegate).toBeUndefined();
-    expect(result.details.transferHook).toBeUndefined();
-    expect(result.details.nonTransferable).toBeUndefined();
+    jest.restoreAllMocks();
   });
 
   test('warns on zero supply', async () => {
-    const tokenInfo = {
-      isToken2022: false,
-      hasFreezeAuthority: false,
-      hasMintAuthority: false,
-      supply: '0',
-    };
+    jest.resetModules();
+    jest.doMock('../src/logger', () => ({
+      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
+      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
+    }));
+    const actualEthers = jest.requireActual('ethers');
+    jest.doMock('ethers', () => ({
+      ...actualEthers,
+      ethers: {
+        ...actualEthers.ethers,
+        Contract: jest.fn().mockImplementation((addr, abi) => {
+          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
+            return {
+              getAmountsOut: jest.fn()
+                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
+                .mockResolvedValueOnce([1000000n, 9500000000000000n]),
+            };
+          }
+          return { owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress) };
+        }),
+        ZeroAddress: actualEthers.ethers.ZeroAddress,
+        getAddress: actualEthers.ethers.getAddress,
+      },
+    }));
 
-    client.get.mockResolvedValue({
-      data: { outAmount: '9800000' },
-    });
+    const { runAntiScamChecks } = require('../src/antiscam');
+    const provider = { getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)) };
+    const tokenInfo = { totalSupply: 0n };
 
-    const result = await runAntiScamChecks(config, 'TokenMint', tokenInfo, { outAmount: '50000000' });
-
+    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
     expect(result.warnings.some((w) => w.includes('zero supply'))).toBe(true);
+
+    jest.restoreAllMocks();
   });
 });

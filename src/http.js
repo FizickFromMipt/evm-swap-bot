@@ -17,7 +17,7 @@ const httpAgent = new http.Agent({
   maxFreeSockets: 5,
 });
 
-// Shared axios instance with keep-alive for all external API calls (Jupiter, DexScreener)
+// Shared axios instance with keep-alive for all external API calls (DexScreener, etc.)
 const client = axios.create({
   httpAgent,
   httpsAgent,

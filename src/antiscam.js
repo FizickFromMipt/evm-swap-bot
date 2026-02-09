@@ -1,143 +1,52 @@
-const { PublicKey } = require('@solana/web3.js');
-const { client } = require('./http');
-const { withRetry } = require('./retry');
+const { ethers } = require('ethers');
 const logger = require('./logger');
+const { WBNB } = require('./config');
+const { ROUTER_ABI } = require('./swap');
 
-// Token-2022 extension type IDs
-const EXT_TRANSFER_FEE_CONFIG = 1;
-const EXT_NON_TRANSFERABLE = 9;
-const EXT_PERMANENT_DELEGATE = 12;
-const EXT_TRANSFER_HOOK = 14;
-
-/**
- * Parse Token-2022 TLV extensions from raw mint account data.
- * Extensions start at byte 83 (after 82-byte mint data + 1 byte account type).
- */
-function parseToken2022Extensions(data) {
-  if (!data || data.length <= 83) return [];
-
-  // Byte 82 must be account type 2 (Mint)
-  if (data[82] !== 2) return [];
-
-  const extensions = [];
-  let offset = 83;
-
-  while (offset + 4 <= data.length) {
-    const type = data.readUInt16LE(offset);
-    const length = data.readUInt16LE(offset + 2);
-    offset += 4;
-
-    if (offset + length > data.length) break;
-
-    extensions.push({ type, data: data.slice(offset, offset + length) });
-    offset += length;
-  }
-
-  return extensions;
-}
+// EIP-1967 implementation slot
+const EIP1967_IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
 
 /**
- * Check for TransferFeeConfig extension (type 1).
- *
- * Layout (108 bytes):
- *   [0..32)   transferFeeConfigAuthority  (Pubkey)
- *   [32..64)  withdrawWithheldAuthority   (Pubkey)
- *   [64..72)  withheldAmount              (u64 LE)
- *   [72..90)  olderTransferFee            (TransferFee)
- *   [90..108) newerTransferFee            (TransferFee)
- *
- * TransferFee (18 bytes): epoch(u64) + maxFee(u64) + bps(u16)
+ * Honeypot detection via roundtrip simulation.
+ * Simulates buy + sell quotes via PancakeSwap getAmountsOut.
+ * If sell returns significantly less BNB than buy cost, it's suspicious.
  */
-function checkTransferFee(extensions) {
-  const ext = extensions.find((e) => e.type === EXT_TRANSFER_FEE_CONFIG);
-  if (!ext || ext.data.length < 108) return null;
-
-  // newerTransferFee.transfer_fee_basis_points at offset 106
-  const feeBps = ext.data.readUInt16LE(106);
-  const maxFee = ext.data.readBigUInt64LE(98);
-
-  return { hasTransferFee: feeBps > 0, feeBps, maxFee: maxFee.toString() };
-}
-
-/**
- * Check for PermanentDelegate extension (type 12).
- * A permanent delegate can transfer or burn anyone's tokens.
- */
-function checkPermanentDelegate(extensions) {
-  const ext = extensions.find((e) => e.type === EXT_PERMANENT_DELEGATE);
-  if (!ext || ext.data.length < 32) return null;
-
-  const delegate = new PublicKey(ext.data.slice(0, 32));
-  if (delegate.equals(PublicKey.default)) return null;
-
-  return { hasPermanentDelegate: true, delegate: delegate.toBase58() };
-}
-
-/**
- * Check for NonTransferable extension (type 9).
- * Token literally cannot be transferred — soulbound.
- */
-function checkNonTransferable(extensions) {
-  return extensions.some((e) => e.type === EXT_NON_TRANSFERABLE);
-}
-
-/**
- * Check for TransferHook extension (type 14).
- * Custom on-chain program executes on every transfer — can reject arbitrarily.
- */
-function checkTransferHook(extensions) {
-  const ext = extensions.find((e) => e.type === EXT_TRANSFER_HOOK);
-  if (!ext || ext.data.length < 32) return null;
-
-  const programId = new PublicKey(ext.data.slice(0, 32));
-  if (programId.equals(PublicKey.default)) return null;
-
-  return { hasTransferHook: true, programId: programId.toBase58() };
-}
-
-/**
- * Simulate a reverse swap (TOKEN → SOL) via Jupiter quote to detect honeypots.
- * If Jupiter can't route the sell, the token may be unsellable.
- */
-async function checkHoneypot(config, tokenMint, buyQuote) {
-  logger.info('Simulating reverse swap (sell) to detect honeypot...');
+async function checkHoneypot(provider, routerAddress, tokenAddress, amountInWei) {
+  logger.info('Simulating roundtrip swap to detect honeypot...');
 
   try {
-    const sellAmount = buyQuote.outAmount;
+    const router = new ethers.Contract(routerAddress, ROUTER_ABI, provider);
 
-    const { data } = await withRetry(
-      () =>
-        client.get(config.jupiterApi.quote, {
-          params: {
-            inputMint: tokenMint,
-            outputMint: config.solMint,
-            amount: sellAmount,
-            slippageBps: config.slippageBps,
-          },
-          timeout: 15000,
-        }),
-      { retries: 2, baseDelay: 1000 }
-    );
+    // Buy quote: BNB → Token
+    const buyPath = [WBNB, tokenAddress];
+    const buyAmounts = await router.getAmountsOut(amountInWei, buyPath);
+    const tokenReceived = buyAmounts[buyAmounts.length - 1];
 
-    if (!data || !data.outAmount) {
-      return {
-        canSell: false,
-        reason: 'No sell route found — token may be a honeypot',
-      };
+    if (tokenReceived === 0n) {
+      return { canSell: false, reason: 'Buy quote returned 0 tokens' };
     }
 
-    // Round-trip loss: how much SOL we lose buying then immediately selling
-    const buyInLamports = BigInt(config.amountLamports);
-    const sellOutLamports = BigInt(data.outAmount);
+    // Sell quote: Token → BNB
+    const sellPath = [tokenAddress, WBNB];
+    let sellAmounts;
+    try {
+      sellAmounts = await router.getAmountsOut(tokenReceived, sellPath);
+    } catch {
+      return { canSell: false, reason: 'Sell quote failed — token may be a honeypot' };
+    }
+
+    const bnbReturned = sellAmounts[sellAmounts.length - 1];
+
+    // Round-trip loss
     const roundTripLossPct =
-      buyInLamports > 0n
-        ? Number((buyInLamports - sellOutLamports) * 10000n / buyInLamports) / 100
+      amountInWei > 0n
+        ? Number((amountInWei - bnbReturned) * 10000n / amountInWei) / 100
         : 0;
 
     const result = {
       canSell: true,
-      sellOutAmount: data.outAmount,
-      sellPriceImpact: data.priceImpactPct || 'N/A',
+      tokenReceived: tokenReceived.toString(),
+      bnbReturned: bnbReturned.toString(),
       roundTripLossPct,
     };
 
@@ -149,105 +58,100 @@ async function checkHoneypot(config, tokenMint, buyQuote) {
 
     return result;
   } catch (err) {
-    return {
-      canSell: false,
-      reason: `Sell simulation failed: ${err.message}`,
-    };
+    return { canSell: false, reason: `Honeypot simulation failed: ${err.message}` };
+  }
+}
+
+/**
+ * Check if contract is an EIP-1967 proxy (upgradeable).
+ * Reads the implementation storage slot.
+ */
+async function checkProxy(provider, tokenAddress) {
+  try {
+    const implSlot = await provider.getStorage(tokenAddress, EIP1967_IMPL_SLOT);
+    const implAddress = '0x' + implSlot.slice(26); // last 20 bytes
+
+    if (implAddress !== '0x' + '0'.repeat(40)) {
+      return { isProxy: true, implementation: ethers.getAddress(implAddress) };
+    }
+    return { isProxy: false };
+  } catch {
+    return { isProxy: false };
+  }
+}
+
+/**
+ * Check if ownership is renounced by calling owner().
+ * If owner is not address(0), ownership is NOT renounced.
+ */
+async function checkOwnership(provider, tokenAddress) {
+  try {
+    const contract = new ethers.Contract(
+      tokenAddress,
+      ['function owner() view returns (address)'],
+      provider
+    );
+    const owner = await contract.owner();
+    const renounced = owner === ethers.ZeroAddress;
+    return { hasOwner: !renounced, owner, renounced };
+  } catch {
+    // owner() not available — assume no owner
+    return { hasOwner: false, owner: null, renounced: true };
   }
 }
 
 /**
  * Run all anti-scam checks and return a risk assessment.
  *
- * @param {object} config       - Bot config (Jupiter API URLs, etc.)
- * @param {string} tokenMint    - Token mint address
- * @param {object} tokenInfo    - Result from validateTokenMint (includes _rawData)
- * @param {object} buyQuote     - Jupiter buy quote (for honeypot simulation)
  * @returns {{ riskLevel: string, warnings: string[], details: object }}
  */
-async function runAntiScamChecks(config, tokenMint, tokenInfo, buyQuote) {
+async function runAntiScamChecks(provider, routerAddress, tokenAddress, amountInWei, tokenInfo) {
   logger.step('Running anti-scam checks...');
 
   const warnings = [];
   const details = {};
 
-  // --- Token-2022 extension checks ---
-  if (tokenInfo.isToken2022 && tokenInfo._rawData) {
-    const extensions = parseToken2022Extensions(tokenInfo._rawData);
-
-    const feeInfo = checkTransferFee(extensions);
-    if (feeInfo && feeInfo.hasTransferFee) {
-      details.transferFee = feeInfo;
-      warnings.push(
-        `Transfer fee: ${feeInfo.feeBps} bps (${(feeInfo.feeBps / 100).toFixed(2)}%) on every transfer`
-      );
-      if (feeInfo.feeBps >= 1000) {
-        warnings.push(`EXTREME transfer fee (${(feeInfo.feeBps / 100).toFixed(0)}%) — likely a scam`);
-      }
-    }
-
-    const delegateInfo = checkPermanentDelegate(extensions);
-    if (delegateInfo) {
-      details.permanentDelegate = delegateInfo;
-      warnings.push(
-        `Permanent delegate (${delegateInfo.delegate}) — can transfer/burn your tokens at any time`
-      );
-    }
-
-    if (checkNonTransferable(extensions)) {
-      details.nonTransferable = true;
-      warnings.push('Token is NON-TRANSFERABLE — you will not be able to sell or transfer it');
-    }
-
-    const hookInfo = checkTransferHook(extensions);
-    if (hookInfo) {
-      details.transferHook = hookInfo;
-      warnings.push(
-        `Transfer hook program (${hookInfo.programId}) — custom logic on every transfer, can reject sells`
-      );
-    }
-  }
-
-  // --- On-chain authority warnings ---
-  if (tokenInfo.hasFreezeAuthority) {
-    warnings.push('Freeze authority active — your tokens can be frozen (blacklist risk)');
-  }
-  if (tokenInfo.hasMintAuthority) {
-    warnings.push('Mint authority active — unlimited token inflation possible');
-  }
-  if (tokenInfo.supply === '0') {
-    warnings.push('Token has zero supply — suspicious');
-  }
-
   // --- Honeypot simulation ---
-  if (buyQuote) {
-    const honeypot = await checkHoneypot(config, tokenMint, buyQuote);
-    details.honeypot = honeypot;
+  const honeypot = await checkHoneypot(provider, routerAddress, tokenAddress, amountInWei);
+  details.honeypot = honeypot;
 
-    if (!honeypot.canSell) {
-      warnings.push(`HONEYPOT RISK: ${honeypot.reason}`);
-    } else if (honeypot.warning) {
-      warnings.push(honeypot.warning);
-    } else {
-      logger.info(
-        `  Sell simulation OK: round-trip loss ${honeypot.roundTripLossPct.toFixed(1)}%`
-      );
+  if (!honeypot.canSell) {
+    warnings.push(`HONEYPOT RISK: ${honeypot.reason}`);
+  } else if (honeypot.warning) {
+    warnings.push(honeypot.warning);
+  } else {
+    logger.info(`  Sell simulation OK: round-trip loss ${honeypot.roundTripLossPct.toFixed(1)}%`);
+  }
+
+  // --- Proxy detection ---
+  const proxy = await checkProxy(provider, tokenAddress);
+  details.proxy = proxy;
+
+  if (proxy.isProxy) {
+    warnings.push(`Contract is an upgradeable proxy (impl: ${proxy.implementation}) — owner can change logic`);
+  }
+
+  // --- Ownership check ---
+  const ownership = await checkOwnership(provider, tokenAddress);
+  details.ownership = ownership;
+
+  if (ownership.hasOwner) {
+    warnings.push(`Ownership NOT renounced (owner: ${ownership.owner}) — owner may have special privileges`);
+  }
+
+  // --- Token info warnings ---
+  if (tokenInfo) {
+    if (tokenInfo.totalSupply === 0n) {
+      warnings.push('Token has zero supply — suspicious');
     }
   }
 
   // --- Determine risk level ---
   const hasCritical = warnings.some(
-    (w) =>
-      w.includes('HONEYPOT') ||
-      w.includes('EXTREME') ||
-      w.includes('Permanent delegate') ||
-      w.includes('NON-TRANSFERABLE')
+    (w) => w.includes('HONEYPOT') || w.includes('Extreme round-trip')
   );
   const hasHigh = warnings.some(
-    (w) =>
-      w.includes('Freeze authority') ||
-      w.includes('Transfer hook') ||
-      w.includes('High round-trip')
+    (w) => w.includes('High round-trip') || w.includes('upgradeable proxy')
   );
 
   let riskLevel = 'low';
@@ -270,9 +174,7 @@ async function runAntiScamChecks(config, tokenMint, tokenInfo, buyQuote) {
 module.exports = {
   runAntiScamChecks,
   checkHoneypot,
-  parseToken2022Extensions,
-  checkTransferFee,
-  checkPermanentDelegate,
-  checkNonTransferable,
-  checkTransferHook,
+  checkProxy,
+  checkOwnership,
+  EIP1967_IMPL_SLOT,
 };

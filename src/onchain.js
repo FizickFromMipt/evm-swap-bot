@@ -1,156 +1,45 @@
-const { PublicKey } = require('@solana/web3.js');
+const { ethers } = require('ethers');
 const logger = require('./logger');
 
-const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
-const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+const ERC20_ABI = [
+  'function name() view returns (string)',
+  'function symbol() view returns (string)',
+  'function decimals() view returns (uint8)',
+  'function totalSupply() view returns (uint256)',
+  'function balanceOf(address) view returns (uint256)',
+  'function owner() view returns (address)',
+];
 
 /**
- * Parse raw SPL Mint account data (82 bytes).
- *
- * Layout:
- *   [0..4)    mintAuthorityOption  (u32 LE)
- *   [4..36)   mintAuthority        (Pubkey)
- *   [36..44)  supply               (u64 LE)
- *   [44]      decimals             (u8)
- *   [45]      isInitialized        (bool)
- *   [46..50)  freezeAuthorityOption (u32 LE)
- *   [50..82)  freezeAuthority      (Pubkey)
+ * Get token info from an ERC20 contract on-chain.
+ * Returns { name, symbol, decimals, totalSupply, owner } or throws.
  */
-function parseMintData(data) {
-  if (!data || data.length < 82) return null;
+async function getTokenInfo(provider, tokenAddress) {
+  logger.step('Fetching token info on-chain...');
 
-  const hasMintAuthority = data.readUInt32LE(0) !== 0;
-  const mintAuthority = hasMintAuthority
-    ? new PublicKey(data.slice(4, 36)).toBase58()
-    : null;
+  const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
 
-  const supply = data.readBigUInt64LE(36);
-  const decimals = data[44];
-  const isInitialized = data[45] !== 0;
+  const [name, symbol, decimals, totalSupply] = await Promise.all([
+    contract.name().catch(() => 'Unknown'),
+    contract.symbol().catch(() => '???'),
+    contract.decimals().catch(() => 18),
+    contract.totalSupply().catch(() => 0n),
+  ]);
 
-  const hasFreezeAuthority = data.readUInt32LE(46) !== 0;
-  const freezeAuthority = hasFreezeAuthority
-    ? new PublicKey(data.slice(50, 82)).toBase58()
-    : null;
-
-  return {
-    supply: supply.toString(),
-    decimals,
-    isInitialized,
-    hasMintAuthority,
-    mintAuthority,
-    hasFreezeAuthority,
-    freezeAuthority,
-  };
-}
-
-/**
- * Validate a token mint on-chain.
- * Checks: account exists, is SPL token, is initialized.
- * Returns warnings about rug risk factors.
- */
-async function validateTokenMint(connection, mintAddress) {
-  logger.step('Validating token mint on-chain...');
-
-  let pubkey;
+  let owner = null;
   try {
-    pubkey = new PublicKey(mintAddress);
+    owner = await contract.owner();
   } catch {
-    return { valid: false, reason: 'Invalid public key format' };
+    // owner() not implemented — no Ownable
   }
 
-  const accountInfo = await connection.getAccountInfo(pubkey);
+  logger.info(`  Name: ${name}`);
+  logger.info(`  Symbol: ${symbol}`);
+  logger.info(`  Decimals: ${decimals}`);
+  logger.info(`  Total supply: ${ethers.formatUnits(totalSupply, decimals)}`);
+  logger.info(`  Owner: ${owner || 'N/A (no Ownable)'}`);
 
-  if (!accountInfo) {
-    return { valid: false, reason: 'Token mint account does not exist on-chain' };
-  }
-
-  // Must be owned by Token Program or Token-2022
-  const owner = accountInfo.owner.toBase58();
-  if (owner !== TOKEN_PROGRAM_ID && owner !== TOKEN_2022_PROGRAM_ID) {
-    return { valid: false, reason: `Account is not an SPL token mint (owner: ${owner})` };
-  }
-
-  const mint = parseMintData(accountInfo.data);
-  if (!mint) {
-    return { valid: false, reason: 'Invalid mint account data (too short)' };
-  }
-
-  if (!mint.isInitialized) {
-    return { valid: false, reason: 'Token mint is not initialized' };
-  }
-
-  // Collect warnings
-  const warnings = [];
-
-  if (mint.supply === '0') {
-    warnings.push('Token has zero supply');
-  }
-
-  if (mint.hasFreezeAuthority) {
-    warnings.push(
-      `Freeze authority is set (${mint.freezeAuthority}) — token accounts can be frozen (rug risk)`
-    );
-  }
-
-  if (mint.hasMintAuthority) {
-    warnings.push(
-      `Mint authority is set (${mint.mintAuthority}) — unlimited tokens can be minted (inflation risk)`
-    );
-  }
-
-  // Log results
-  logger.info(`  Token program: ${owner === TOKEN_2022_PROGRAM_ID ? 'Token-2022' : 'SPL Token'}`);
-  logger.info(`  Supply: ${mint.supply} (${mint.decimals} decimals)`);
-  logger.info(`  Mint authority: ${mint.mintAuthority || 'revoked'}`);
-  logger.info(`  Freeze authority: ${mint.freezeAuthority || 'revoked'}`);
-
-  if (warnings.length > 0) {
-    logger.sep();
-    logger.warn('On-chain risk warnings:');
-    warnings.forEach((w) => logger.warn(`  - ${w}`));
-  } else {
-    logger.success('No on-chain risk flags detected');
-  }
-
-  return {
-    valid: true,
-    supply: mint.supply,
-    decimals: mint.decimals,
-    hasMintAuthority: mint.hasMintAuthority,
-    mintAuthority: mint.mintAuthority,
-    hasFreezeAuthority: mint.hasFreezeAuthority,
-    freezeAuthority: mint.freezeAuthority,
-    isToken2022: owner === TOKEN_2022_PROGRAM_ID,
-    warnings,
-    _rawData: accountInfo.data, // raw Buffer for Token-2022 extension parsing
-  };
+  return { name, symbol, decimals, totalSupply, owner };
 }
 
-/**
- * Check that a pool account exists on-chain.
- * Returns { exists, owner, dataSize } or { exists: false }.
- */
-async function validatePoolAccount(connection, poolAddress) {
-  let pubkey;
-  try {
-    pubkey = new PublicKey(poolAddress);
-  } catch {
-    return { exists: false, reason: 'Invalid pool address' };
-  }
-
-  const accountInfo = await connection.getAccountInfo(pubkey);
-
-  if (!accountInfo) {
-    return { exists: false, reason: 'Pool account does not exist on-chain' };
-  }
-
-  return {
-    exists: true,
-    owner: accountInfo.owner.toBase58(),
-    dataSize: accountInfo.data.length,
-    lamports: accountInfo.lamports,
-  };
-}
-
-module.exports = { validateTokenMint, validatePoolAccount, parseMintData };
+module.exports = { getTokenInfo, ERC20_ABI };

@@ -3,12 +3,12 @@ const { withRetry } = require('./retry');
 const logger = require('./logger');
 
 /**
- * Fetch all Solana pools for a given token mint from DexScreener.
+ * Fetch all BSC pools for a given token address from DexScreener.
  */
-async function fetchPools(apiUrl, tokenMint) {
-  logger.step(`Fetching pools from DexScreener for: ${tokenMint}`);
+async function fetchPools(apiUrl, tokenAddress) {
+  logger.step(`Fetching pools from DexScreener for: ${tokenAddress}`);
 
-  const url = `${apiUrl}/${tokenMint}`;
+  const url = `${apiUrl}/${tokenAddress}`;
   logger.info(`API: ${url}`);
 
   const { data } = await withRetry(
@@ -27,15 +27,15 @@ async function fetchPools(apiUrl, tokenMint) {
 
   logger.info(`Total pairs from DexScreener: ${data.pairs.length}`);
 
-  const solanaPairs = data.pairs.filter((p) => p.chainId === 'solana');
-  logger.info(`Solana pairs: ${solanaPairs.length}`);
+  const bscPairs = data.pairs.filter((p) => p.chainId === 'bsc');
+  logger.info(`BSC pairs: ${bscPairs.length}`);
 
-  if (solanaPairs.length === 0) {
+  if (bscPairs.length === 0) {
     const chains = [...new Set(data.pairs.map((p) => p.chainId))];
-    throw new Error(`No Solana pools found. Available chains: ${chains.join(', ') || 'none'}`);
+    throw new Error(`No BSC pools found. Available chains: ${chains.join(', ') || 'none'}`);
   }
 
-  return solanaPairs;
+  return bscPairs;
 }
 
 module.exports = { fetchPools };

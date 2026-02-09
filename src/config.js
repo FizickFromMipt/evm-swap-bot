@@ -1,52 +1,33 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { Keypair } = require('@solana/web3.js');
-const bs58 = require('bs58');
+const { ethers } = require('ethers');
 
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const PANCAKE_ROUTER = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+const PANCAKE_FACTORY = '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73';
 
-const JUPITER_API = {
-  quote: 'https://quote-api.jup.ag/v6/quote',
-  swap: 'https://quote-api.jup.ag/v6/swap',
-};
+const WBNB = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
+const USDT = '0x55d398326f99059fF775485246999027B3197955';
+const USDC = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
+const BUSD = '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56';
 
 const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex/tokens';
 
-// Known genesis hashes for network detection
-const GENESIS_HASHES = {
-  '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d': 'mainnet-beta',
-  'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG': 'devnet',
-  '4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z': 'testnet',
-};
-
 /**
- * Convert SOL string to lamports using integer arithmetic (no float rounding issues).
+ * Convert BNB string to wei using integer arithmetic (no float rounding issues).
+ * BNB uses 18 decimals.
  */
-function solToLamports(solString) {
-  const parts = solString.split('.');
+function bnbToWei(bnbString) {
+  const parts = bnbString.split('.');
   const whole = parts[0] || '0';
   const frac = parts[1] || '';
-  const paddedFrac = frac.padEnd(9, '0').slice(0, 9);
-  return parseInt(whole, 10) * 1_000_000_000 + parseInt(paddedFrac, 10);
-}
-
-/**
- * Parse a private key from base58 string or JSON byte array.
- */
-function loadKeypair(raw) {
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) throw new Error('not an array');
-    return Keypair.fromSecretKey(Uint8Array.from(parsed));
-  } catch {
-    return Keypair.fromSecretKey(bs58.decode(raw));
-  }
+  const paddedFrac = frac.padEnd(18, '0').slice(0, 18);
+  return BigInt(whole) * 1_000_000_000_000_000_000n + BigInt(paddedFrac);
 }
 
 /**
  * Load private key from PRIVATE_KEY env var or PRIVATE_KEY_PATH file.
- * Returns the raw key string. Caller must parse with loadKeypair().
+ * Returns the raw key string.
  */
 function loadPrivateKeyRaw() {
   const keyPath = process.env.PRIVATE_KEY_PATH;
@@ -62,13 +43,11 @@ function loadPrivateKeyRaw() {
       throw new Error(`PRIVATE_KEY_PATH file not found: ${resolved}`);
     }
 
-    // Check file permissions on Unix — warn if world-readable
     if (process.platform !== 'win32') {
       try {
         const stat = fs.statSync(resolved);
         const mode = stat.mode & 0o777;
         if (mode & 0o044) {
-          // File is readable by group or others
           console.error(
             `[SECURITY WARNING] Key file ${resolved} is readable by others (mode: ${mode.toString(8)}). ` +
               'Run: chmod 600 ' + resolved
@@ -109,36 +88,21 @@ function checkEnvFilePermissions() {
 }
 
 /**
- * Detect Solana network from genesis hash.
- * Returns 'mainnet-beta', 'devnet', 'testnet', or 'unknown'.
- */
-async function detectNetwork(connection) {
-  try {
-    const genesisHash = await connection.getGenesisHash();
-    return GENESIS_HASHES[genesisHash] || 'unknown';
-  } catch {
-    return 'unknown';
-  }
-}
-
-/**
  * Create a safe config object that won't leak the private key
  * if accidentally serialized (JSON.stringify, console.log, etc.).
  */
 function createSafeConfig(configData) {
   const config = { ...configData };
 
-  // Override toJSON to redact keypair
   config.toJSON = function () {
-    const { keypair, ...safe } = this;
+    const { wallet, ...safe } = this;
     return {
       ...safe,
-      keypair: keypair ? `[Keypair: ${keypair.publicKey.toBase58()}]` : undefined,
+      wallet: wallet ? `[Wallet: ${wallet.address}]` : undefined,
       toJSON: undefined,
     };
   };
 
-  // Override inspect for console.log / util.inspect
   const inspect = Symbol.for('nodejs.util.inspect.custom');
   config[inspect] = function () {
     return this.toJSON();
@@ -150,33 +114,44 @@ function createSafeConfig(configData) {
 function loadConfig() {
   checkEnvFilePermissions();
 
-  const rpcUrl = process.env.SOLANA_RPC_URL;
-  const buyAmountSol = process.env.BUY_AMOUNT_SOL;
-  const slippageBps = parseInt(process.env.SLIPPAGE_BPS || '500', 10);
-  const priorityFee = process.env.PRIORITY_FEE || 'auto';
-  const maxBuySol = parseFloat(process.env.MAX_BUY_SOL || '10');
+  const rpcUrl = process.env.RPC_URL;
+  const buyAmountBnb = process.env.BUY_AMOUNT_BNB;
+  const slippagePercent = parseFloat(process.env.SLIPPAGE_PERCENT || '5');
+  const gasLimit = parseInt(process.env.GAS_LIMIT || '300000', 10);
+  const maxGasPriceGwei = parseFloat(process.env.MAX_GAS_PRICE_GWEI || '5');
+  const buyRetries = parseInt(process.env.BUY_RETRIES || '3', 10);
+  const buyRetryDelayMs = parseInt(process.env.BUY_RETRY_DELAY_MS || '500', 10);
+  const simulateBeforeBuy = (process.env.SIMULATE_BEFORE_BUY || 'false').toLowerCase() === 'true';
+  const maxBuyBnb = parseFloat(process.env.MAX_BUY_BNB || '1');
+  const minLiquidityUsd = parseFloat(process.env.MIN_LIQUIDITY_USD || '1000');
+  const maxTokenAgeSec = parseInt(process.env.MAX_TOKEN_AGE_SEC || '300', 10);
+  const pollIntervalMs = parseInt(process.env.POLL_INTERVAL_MS || '3000', 10);
 
   const errors = [];
-  if (!rpcUrl) errors.push('SOLANA_RPC_URL is required in .env');
-  if (!buyAmountSol || isNaN(parseFloat(buyAmountSol))) {
-    errors.push('BUY_AMOUNT_SOL must be a valid number in .env');
-  } else if (parseFloat(buyAmountSol) <= 0) {
-    errors.push('BUY_AMOUNT_SOL must be greater than 0');
-  } else if (parseFloat(buyAmountSol) > maxBuySol) {
-    errors.push(`BUY_AMOUNT_SOL (${buyAmountSol}) exceeds MAX_BUY_SOL (${maxBuySol}). Increase MAX_BUY_SOL in .env if intentional.`);
+  if (!rpcUrl) errors.push('RPC_URL is required in .env');
+  if (!buyAmountBnb || isNaN(parseFloat(buyAmountBnb))) {
+    errors.push('BUY_AMOUNT_BNB must be a valid number in .env');
+  } else if (parseFloat(buyAmountBnb) <= 0) {
+    errors.push('BUY_AMOUNT_BNB must be greater than 0');
+  } else if (parseFloat(buyAmountBnb) > maxBuyBnb) {
+    errors.push(`BUY_AMOUNT_BNB (${buyAmountBnb}) exceeds MAX_BUY_BNB (${maxBuyBnb}). Increase MAX_BUY_BNB in .env if intentional.`);
   }
-  if (isNaN(slippageBps) || slippageBps < 0) errors.push('SLIPPAGE_BPS must be a non-negative integer');
-  if (slippageBps > 5000) errors.push('SLIPPAGE_BPS exceeds 5000 (50%) — likely a mistake');
+  if (isNaN(slippagePercent) || slippagePercent < 0) errors.push('SLIPPAGE_PERCENT must be a non-negative number');
+  if (slippagePercent > 50) errors.push('SLIPPAGE_PERCENT exceeds 50% — likely a mistake');
+  if (isNaN(gasLimit) || gasLimit <= 0) errors.push('GAS_LIMIT must be a positive integer');
+  if (isNaN(maxGasPriceGwei) || maxGasPriceGwei <= 0) errors.push('MAX_GAS_PRICE_GWEI must be a positive number');
 
-  // Load private key (inline or from file)
+  // Load private key
   let privateKeyRaw;
+  let keyLoadError = false;
   try {
     privateKeyRaw = loadPrivateKeyRaw();
   } catch (err) {
     errors.push(err.message);
+    keyLoadError = true;
   }
 
-  if (!privateKeyRaw) {
+  if (!privateKeyRaw && !keyLoadError) {
     errors.push('PRIVATE_KEY or PRIVATE_KEY_PATH is required');
   }
 
@@ -184,36 +159,53 @@ function loadConfig() {
     throw new Error('Configuration errors:\n  - ' + errors.join('\n  - '));
   }
 
-  let keypair;
+  // Normalize private key — add 0x prefix if missing
+  let normalizedKey = privateKeyRaw;
+  if (!normalizedKey.startsWith('0x')) {
+    normalizedKey = '0x' + normalizedKey;
+  }
+
+  let wallet;
   try {
-    keypair = loadKeypair(privateKeyRaw);
+    wallet = new ethers.Wallet(normalizedKey);
   } catch (err) {
     throw new Error(`Failed to parse PRIVATE_KEY: ${err.message}`);
   }
 
-  const amountLamports = solToLamports(buyAmountSol);
+  const buyAmountWei = bnbToWei(buyAmountBnb);
 
   return createSafeConfig({
     rpcUrl,
-    keypair,
-    buyAmountSol,
-    amountLamports,
-    slippageBps,
-    priorityFee,
-    solMint: SOL_MINT,
-    jupiterApi: JUPITER_API,
+    wallet,
+    buyAmountBnb,
+    buyAmountWei,
+    slippagePercent,
+    gasLimit,
+    maxGasPriceGwei,
+    buyRetries,
+    buyRetryDelayMs,
+    simulateBeforeBuy,
+    maxBuyBnb,
+    minLiquidityUsd,
+    maxTokenAgeSec,
+    pollIntervalMs,
     dexscreenerApi: DEXSCREENER_API,
+    pancakeRouter: PANCAKE_ROUTER,
+    pancakeFactory: PANCAKE_FACTORY,
+    wbnb: WBNB,
   });
 }
 
 module.exports = {
   loadConfig,
-  solToLamports,
-  detectNetwork,
+  bnbToWei,
   createSafeConfig,
   loadPrivateKeyRaw,
-  SOL_MINT,
-  JUPITER_API,
+  PANCAKE_ROUTER,
+  PANCAKE_FACTORY,
+  WBNB,
+  USDT,
+  USDC,
+  BUSD,
   DEXSCREENER_API,
-  GENESIS_HASHES,
 };

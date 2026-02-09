@@ -1,8 +1,10 @@
+const { ethers } = require('ethers');
+
 /**
- * Check if a string is a valid Solana base58 mint address (32-44 chars, base58 alphabet).
+ * Check if a string is a valid EVM address (0x-prefixed, 20 bytes hex).
  */
-function isValidSolanaMint(addr) {
-  return typeof addr === 'string' && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr);
+function isValidAddress(addr) {
+  return typeof addr === 'string' && ethers.isAddress(addr);
 }
 
-module.exports = { isValidSolanaMint };
+module.exports = { isValidAddress };

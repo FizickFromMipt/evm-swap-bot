@@ -1,6 +1,6 @@
-# Solana Token Buyer CLI Bot
+# BSC Token Buyer CLI Bot
 
-CLI-бот для покупки токенов на Solana через Jupiter V6 aggregator. Включает on-chain валидацию, anti-scam проверки, анализ пулов и механизмы безопасности транзакций.
+CLI-бот для покупки токенов на BSC (BNB Smart Chain) через PancakeSwap V2 Router. Включает on-chain валидацию ERC20 токенов, anti-scam проверки (honeypot, proxy, ownership), анализ пулов через DexScreener и механизмы безопасности транзакций.
 
 ## Установка
 
@@ -14,122 +14,124 @@ cp .env.example .env
 
 | Переменная | Обязательная | По умолчанию | Описание |
 |---|---|---|---|
-| `SOLANA_RPC_URL` | Да | — | Solana RPC endpoint |
-| `PRIVATE_KEY` | Да* | — | Base58 (Phantom) или JSON array (solana-keygen) |
+| `RPC_URL` | Да | — | BSC RPC endpoint (например `https://bsc-dataseed.binance.org/`) |
+| `PRIVATE_KEY` | Да* | — | Hex-строка (с или без `0x` префикса) |
 | `PRIVATE_KEY_PATH` | Да* | — | Путь к файлу ключа (альтернатива `PRIVATE_KEY`) |
-| `BUY_AMOUNT_SOL` | Да | — | Сколько SOL тратить |
-| `SLIPPAGE_BPS` | Нет | `500` | Проскальзывание (500 = 5%) |
-| `PRIORITY_FEE` | Нет | `auto` | Priority fee в lamports или `"auto"` |
-| `MAX_BUY_SOL` | Нет | `10` | Максимум SOL на одну покупку (safety cap) |
+| `BUY_AMOUNT_BNB` | Да | — | Сколько BNB тратить на покупку |
+| `SLIPPAGE_PERCENT` | Нет | `5` | Проскальзывание в процентах |
+| `GAS_LIMIT` | Нет | `300000` | Gas limit для swap транзакции |
+| `MAX_GAS_PRICE_GWEI` | Нет | `5` | Максимальная цена газа в gwei (safety cap) |
+| `BUY_RETRIES` | Нет | `3` | Количество повторов при ошибке транзакции |
+| `BUY_RETRY_DELAY_MS` | Нет | `500` | Задержка между повторами в мс |
+| `SIMULATE_BEFORE_BUY` | Нет | `false` | Симулировать swap перед покупкой |
+| `MAX_BUY_BNB` | Нет | `1` | Максимум BNB на одну покупку (safety cap) |
+| `MIN_LIQUIDITY_USD` | Нет | `1000` | Минимальная ликвидность пула в USD |
+| `MAX_TOKEN_AGE_SEC` | Нет | `300` | Максимальный возраст токена в секундах |
+| `POLL_INTERVAL_MS` | Нет | `3000` | Интервал опроса DexScreener в мс |
 
 \* Используйте либо `PRIVATE_KEY`, либо `PRIVATE_KEY_PATH` — не оба.
 
 ### RPC
 
-Публичный RPC (`https://api.mainnet-beta.solana.com`) имеет лимиты. Для продакшена:
-- [Helius](https://helius.dev)
+Публичный BSC RPC (`https://bsc-dataseed.binance.org/`) имеет лимиты. Для продакшена:
 - [QuickNode](https://quicknode.com)
-- [Alchemy](https://alchemy.com)
+- [Ankr](https://ankr.com)
+- [NodeReal](https://nodereal.io)
+- BSC альтернативные dataseed: `https://bsc-dataseed1.defibit.io/`, `https://bsc-dataseed1.ninicoin.io/`
 
 ## Использование
 
 ```bash
 # Базовая покупка
-npm start <TOKEN_MINT>
+npm start <TOKEN_ADDRESS>
 
 # Dry run — анализ без выполнения свопа
-npm start <TOKEN_MINT> --dry-run
+npm start <TOKEN_ADDRESS> --dry-run
 
 # Своя сумма
-npm start <TOKEN_MINT> --amount 0.5
-
-# Процент от баланса кошелька
-npm start <TOKEN_MINT> --percent 50
+npm start <TOKEN_ADDRESS> --amount 0.05
 
 # Без подтверждений (авто-режим)
-npm start <TOKEN_MINT> --yes
+npm start <TOKEN_ADDRESS> --yes
 
 # Комбинация флагов
-npm start <TOKEN_MINT> --amount 0.1 --dry-run --yes
+npm start <TOKEN_ADDRESS> --amount 0.1 --dry-run --yes
+
+# Continuous mode — мониторинг новых токенов
+npm start --continuous
 ```
 
 ## Поток транзакции
 
-Бот выполняет эти шаги по порядку. У каждого шага конкретная задача безопасности:
-
 ```
- 1. CLI Args & Config     → Парсинг флагов, загрузка .env, валидация входных данных
- 2. RPC Warmup            → Установка keep-alive соединения, проверка баланса
- 3. Network Detection     → Определение mainnet/devnet/testnet по genesis hash
- 4. Priority Fee Estimate → Запрос недавних комиссий для оптимальной цены транзакции
- 5. On-chain Validation   → Проверка что token mint существует и инициализирован
- 6. Pool Analysis         → Поиск пулов через DexScreener + on-chain верификация
- 7. Jupiter Quote         → Получение котировки со slippage protection
- 8. Anti-Scam Checks      → Парсинг Token-2022 расширений, симуляция honeypot
- 9. Confirmation          → Человеко-читаемая сводка, подтверждение от пользователя
-10. Quote Freshness       → Перекотировка если >10с, отмена при >10% падении цены
-11. Execute Swap          → Отправка транзакции с retry + повышением fee при таймауте
-12. Result                → TX signature + ссылки на explorer
+ 1. CLI Args & Config     -> Парсинг флагов, загрузка .env, валидация входных данных
+ 2. RPC Connection        -> Подключение к BSC, определение chainId (56/97)
+ 3. Balance Check         -> Проверка баланса BNB, сравнение с суммой покупки
+ 4. Gas Price             -> Получение текущей цены газа, применение cap из конфига
+ 5. On-chain Validation   -> Чтение ERC20 контракта (name, symbol, decimals, totalSupply)
+ 6. Pool Analysis         -> DexScreener API -> фильтрация и скоринг пулов
+ 7. Anti-Scam Checks      -> Honeypot simulation, proxy detection, ownership check
+ 8. Confirmation          -> Сводка для пользователя, подтверждение
+ 9. Execute Swap          -> PancakeSwap V2 Router swap с retry логикой
+10. Result                -> TX hash + ссылка на BscScan
 ```
 
 ### Почему каждый шаг важен
 
-**Шаг 2 — RPC Warmup**: 4 RPC вызова (`getVersion`, `getSlot`, `getLatestBlockhash`, `getBalance`) через одно keep-alive TCP соединение. Гарантирует "горячее" соединение до time-sensitive swap транзакции, экономя ~200-500мс.
+**Шаг 2 — RPC Connection**: Подключается к BSC через `ethers.JsonRpcProvider`. Определяет chainId: 56 = mainnet (предупреждение о реальных средствах), 97 = testnet. Предотвращает случайное использование средств в неправильной сети.
 
-**Шаг 3 — Network Detection**: Сравнивает genesis hash RPC-ноды с известными значениями. Предотвращает случайное использование реальных средств на mainnet. Требует явного подтверждения на mainnet.
+**Шаг 4 — Gas Price**: Получает текущую цену газа через `provider.getFeeData()`. Если цена превышает `MAX_GAS_PRICE_GWEI`, автоматически ограничивает. Защищает от переплаты за газ в периоды высокой нагрузки.
 
-**Шаг 5 — On-chain Validation**: Читает сырые 82 байта SPL Mint account data. Проверяет:
-- Account принадлежит Token Program или Token-2022
-- Mint инициализирован
-- Предупреждает если mint authority установлен (риск инфляции)
-- Предупреждает если freeze authority установлен (риск чёрного списка)
+**Шаг 5 — On-chain Validation**: Читает ERC20 контракт через ethers.Contract. Получает name, symbol, decimals, totalSupply. Опционально проверяет `owner()` (Ownable). Если контракт не отвечает — токен невалиден.
 
-**Шаг 7 — Jupiter Quote**: Jupiter V6 `ExactIn` котировка. Поле `otherAmountThreshold` — это фактический `amountOutMin`, отправляемый в swap. Это и есть slippage protection. Jupiter рассчитывает его как: `outAmount * (10000 - slippageBps) / 10000`.
+**Шаг 6 — Pool Analysis**: DexScreener API возвращает все пулы для токена. Бот фильтрует:
+- Только BSC (`chainId === 'bsc'`)
+- Только доверенные DEX (PancakeSwap, BiSwap)
+- Только ликвидные quote-токены (WBNB, USDT, USDC — tier 1; BUSD — tier 2)
+- Только пулы с ненулевой ликвидностью
 
-**Шаг 8 — Anti-Scam Checks**: Для Token-2022 токенов парсит TLV расширения начиная с байта 83:
-- **TransferFeeConfig** (type 1): Обнаружение buy/sell tax. >10% помечается как EXTREME.
-- **PermanentDelegate** (type 12): Может перевести/сжечь чужие токены.
-- **NonTransferable** (type 9): Soulbound — нельзя продать никогда.
-- **TransferHook** (type 14): Кастомная программа на каждый трансфер — может отклонять продажи.
-- **Honeypot симуляция**: Запрашивает обратную котировку (TOKEN→SOL). Если Jupiter не может построить маршрут — токен может быть непродаваемым. Round-trip потеря >50% помечается как extreme.
+Затем применяет композитный скоринг (liquidity, volume, turnover, quote quality, tx activity) и выбирает лучший пул.
 
-**Шаг 10 — Quote Freshness**: Если пользователь потратил >10с на подтверждение, котировка может устареть. Бот перекотирует и сравнивает. Если новая цена хуже >10%, отменяет (если нет `--yes`).
+**Шаг 7 — Anti-Scam Checks**: Три независимые проверки:
+- **Honeypot simulation**: Запрашивает `getAmountsOut` для пути BNB→Token→BNB. Если обратный swap (sell) не возможен или теряет >50% — критический риск. >20% — высокий риск.
+- **EIP-1967 Proxy Detection**: Читает storage slot `0x360894...`. Если установлен — контракт upgradeable, владелец может изменить логику.
+- **Ownership Check**: Вызывает `owner()`. Если owner != `address(0)` — ownership не renounced, владелец может иметь привилегии.
 
-**Шаг 11 — Retry с повышением Fee**: При таймауте или истечении blockhash бот повторяет до 3 раз с увеличением priority fee в 1.5x. Это предотвращает застревание транзакций при загруженности сети.
+**Шаг 9 — Execute Swap**: Вызывает `swapExactETHForTokensSupportingFeeOnTransferTokens` на PancakeSwap V2 Router. Использует `SupportingFeeOnTransfer` вариант для безопасной работы с дефляционными/tax токенами. При ошибке повторяет до `BUY_RETRIES` раз (не повторяет on-chain revert). Deadline: 5 минут.
 
 ## Архитектура
 
 ```
 src/
-├── index.js          Главная точка входа, оркестрация всего потока
-├── config.js         Загрузка .env, управление ключами, детекция сети
-├── validate.js       Валидация адресов Solana (base58, длина)
+├── index.js          Главная точка входа, оркестрация потока, CLI парсинг
+├── config.js         Загрузка .env, ethers.Wallet, bnbToWei(), BSC константы
+├── validate.js       Валидация EVM адресов (ethers.isAddress)
 ├── http.js           Общий axios instance с keep-alive agents
 ├── retry.js          Экспоненциальный backoff для transient ошибок
 ├── logger.js         Цветной вывод в консоль с timestamps
 ├── dexscreener.js    Клиент DexScreener API (поиск пулов)
-├── poolSelector.js   Фильтрация, скоринг и ранжирование пулов
-├── onchain.js        On-chain валидация token mint и пулов
-├── fees.js           Оценка network priority fee из недавних слотов
-├── jupiter.js        Jupiter V6 quote + swap с retry логикой
-└── antiscam.js       Парсинг Token-2022 расширений, детекция honeypot
+├── poolSelector.js   Фильтрация, скоринг и ранжирование BSC пулов
+├── onchain.js        On-chain ERC20 чтение (name, symbol, decimals, totalSupply)
+├── fees.js           Получение gas price через provider.getFeeData()
+├── swap.js           PancakeSwap V2 Router swap с retry логикой
+└── antiscam.js       Honeypot simulation, proxy detection, ownership check
 ```
 
 ### Ключевые архитектурные решения
 
-**Jupiter управляет роутингом, не мы.** Бот делегирует все решения по роутингу (какой AMM, какой путь, multi-hop) Jupiter aggregator. Анализ пулов через DexScreener — чисто информационный. Показывает какие пулы существуют, но не ограничивает роутинг Jupiter.
+**PancakeSwap V2 Router напрямую.** Бот взаимодействует с Router контрактом (`0x10ED43C718714eb63d5aA57B78B54704E256024E`) через ethers.Contract. Путь свопа: `[WBNB, tokenAddress]`. Без посредников и агрегаторов — прямой on-chain swap.
 
-**Нет v2/v3/v4 разделения в коде.** Так как Jupiter абстрагирует все AMM (Raydium v4, Orca Whirlpool/CLMM, Meteora DLMM, Phoenix), в нашем коде нет AMM-специфичной логики. Тип пула (v2/v3) логируется из DexScreener labels, но не влияет на выполнение.
+**`SupportingFeeOnTransferTokens` вариант.** Обычный `swapExactETHForTokens` упадёт на дефляционных токенах (когда фактически полученная сумма меньше ожидаемой из-за tax). Вариант `SupportingFeeOnTransfer` учитывает это.
 
-**Нет infinite approvals.** Jupiter V6 swap API использует одну атомарную транзакцию. Нет отдельного шага `approve` — SOL оборачивается и свопится в одной транзакции. Никакие approvals не остаются висеть.
+**Honeypot = roundtrip simulation.** Запрашиваем `getAmountsOut` для buy (BNB→Token) и sell (Token→BNB). Если sell quote не возможен — honeypot. Если round-trip loss экстремальный — скрытый tax.
 
-**Целочисленная арифметика для SOL→lamport.** `solToLamports()` использует split строки + parseInt, а не `parseFloat() * 1e9`. Это исключает ошибки округления float (пример: `0.29 * 1e9 = 289999999.99999997`).
+**EIP-1967 proxy detection.** Читаем storage slot `0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc`. Если не нулевой — контракт является upgradeable proxy, владелец может изменить логику в любой момент.
 
-**Приватный ключ никогда не сериализуется.** `createSafeConfig()` переопределяет `toJSON()` и `util.inspect` чтобы редактировать keypair. Даже если config случайно залогирован, виден только public key.
+**Целочисленная арифметика для BNB -> wei.** `bnbToWei()` использует split строки + padEnd, а не `parseFloat() * 1e18`. Это исключает ошибки округления float.
 
-**Добавление новой сети невозможно без рефакторинга.** Весь бот привязан к Solana: `@solana/web3.js`, Jupiter API, SPL Token layout, Token-2022 парсинг. Другая сеть (EVM/BSC) — это фактически другой проект.
+**Приватный ключ никогда не сериализуется.** `createSafeConfig()` переопределяет `toJSON()` и `util.inspect` чтобы редактировать wallet. Даже если config случайно залогирован, виден только адрес кошелька.
 
-**Подключение другого источника пулов** возможно с адаптером. `dexscreener.js` изолирован, но `poolSelector.js` ожидает формат DexScreener. Нужен нормализующий слой для другого API.
+**ethers v6 с нативными BigInt.** Все суммы (wei, gas, amounts) — BigInt. Slippage рассчитывается через bps (basis points) для поддержки дробных процентов.
 
 ## Exit Codes
 
@@ -139,42 +141,26 @@ src/
 | 1 | `BAD_ARGS` | Невалидные аргументы CLI |
 | 2 | `CONFIG_ERROR` | Ошибка конфигурации .env |
 | 3 | `RPC_ERROR` | RPC соединение не удалось |
-| 4 | `INSUFFICIENT_FUNDS` | Недостаточно SOL |
-| 5 | `QUOTE_ERROR` | Jupiter quote не удался |
+| 4 | `INSUFFICIENT_FUNDS` | Недостаточно BNB |
+| 5 | `QUOTE_ERROR` | Ошибка получения котировки |
 | 6 | `SWAP_ERROR` | Транзакция провалилась |
 | 7 | `USER_CANCELLED` | Пользователь отменил |
-| 8 | `TOKEN_INVALID` | Token mint невалиден on-chain |
-| 9 | `PRICE_DEVIATION` | Цена сдвинулась >10% между котировкой и исполнением |
+| 8 | `TOKEN_INVALID` | Token контракт невалиден on-chain |
+| 9 | `PRICE_DEVIATION` | Цена сдвинулась между котировкой и исполнением |
 | 10 | `SCAM_DETECTED` | Обнаружен критический anti-scam риск |
-
-## Диагностика ошибок
-
-Когда swap проваливается on-chain, бот логирует:
-- Разобранное сообщение об ошибке (напр. "Slippage tolerance exceeded" вместо сырого `{Custom: 6001}`)
-- TX signature со ссылкой на Solscan (можно посмотреть проваленную транзакцию)
-- Transaction logs (последние 10 строк из `getTransaction`)
-- Полный контекст: токен, сумма, slippage, ожидаемый output, минимальный output
 
 ## Ссылки на транзакции
 
 После успешного свопа бот выводит:
 ```
-TX Signature: <base58_signature>
-Solscan:          https://solscan.io/tx/<signature>
-Solana Explorer:  https://explorer.solana.com/tx/<signature>
+TX Hash: 0x...
+BscScan: https://bscscan.com/tx/0x...
 ```
 
-Эти ссылки корректны потому что:
-- Signature — это возврат из `connection.sendRawTransaction()`, реальный on-chain transaction ID
-- Solscan и Solana Explorer индексируют транзакции по этому signature
-- Транзакция подтверждена с `confirmed` commitment до показа ссылки
-- При провале ссылка на Solscan всё равно показывается — проваленная транзакция видна в explorer для дебага
-
-При провале свопа бот дополнительно выводит:
+При провале свопа:
 ```
-TX (failed): https://solscan.io/tx/<signature>
+TX (failed): https://bscscan.com/tx/0x...
 ```
-Это позволяет проверить точную причину провала через explorer: какая инструкция провалилась, какие логи оставила программа, и какие были балансы на момент транзакции.
 
 ## Тестирование
 
@@ -183,7 +169,7 @@ TX (failed): https://solscan.io/tx/<signature>
 npm test
 
 # Конкретный suite
-npx jest tests/integration.test.js
+npx jest tests/swap.test.js
 
 # С coverage
 npx jest --coverage
@@ -193,25 +179,24 @@ npx jest --coverage
 
 | Suite | Что покрывает |
 |---|---|
-| `config.test.js` | Загрузка конфига, форматы ключей, детекция сети, safe serialization |
-| `validate.test.js` | Валидация адресов Solana (base58 charset, длина) |
+| `config.test.js` | bnbToWei, loadConfig, валидация конфига, safe serialization |
+| `validate.test.js` | Валидация EVM адресов (ethers.isAddress) |
 | `retry.test.js` | Exponential backoff, retryable vs non-retryable ошибки |
-| `dexscreener.test.js` | Парсинг API ответов, фильтрация по chain |
+| `dexscreener.test.js` | Парсинг API ответов, фильтрация по BSC chain |
 | `poolSelector.test.js` | Фильтрация пулов, композитный скоринг, ранжирование |
-| `onchain.test.js` | Парсинг mint data, валидация токенов, проверка пулов |
-| `fees.test.js` | Оценка priority fee, расчёт перцентилей |
-| `jupiter.test.js` | Получение котировки, исполнение swap, retry с fee bumping |
-| `antiscam.test.js` | Token-2022 расширения, honeypot симуляция, risk assessment |
-| `integration.test.js` | Полный поток: dry-run, swap, error exits, порядок шагов |
-
-190 тестов, 10 test suites.
+| `onchain.test.js` | ERC20 getTokenInfo, обработка ошибок контракта |
+| `fees.test.js` | Gas price fetch, cap при превышении лимита |
+| `swap.test.js` | PancakeSwap quote, slippage, swap execution, revert handling |
+| `antiscam.test.js` | Honeypot simulation, proxy detection, ownership check, risk levels |
+| `integration.test.js` | CLI parseArgs, EXIT codes |
 
 ## Безопасность
 
 - **Никогда** не коммитьте `.env` с приватным ключом
 - Используйте `PRIVATE_KEY_PATH` с `chmod 600` для лучшей защиты ключа
 - Бот предупреждает если `.env` файл читаем другими (Unix)
-- Начинайте с малых сумм (`BUY_AMOUNT_SOL=0.001`) и `--dry-run`
-- На mainnet бот требует явного подтверждения (или `--yes`)
-- `MAX_BUY_SOL` ограничивает максимальную сумму (по умолчанию 10 SOL)
+- Начинайте с малых сумм (`BUY_AMOUNT_BNB=0.001`) и `--dry-run`
+- На mainnet (chainId 56) бот предупреждает о реальных средствах
+- `MAX_BUY_BNB` ограничивает максимальную сумму (по умолчанию 1 BNB)
+- `MAX_GAS_PRICE_GWEI` защищает от переплаты за газ
 - Anti-scam проверки автоматически блокируют критически рискованные токены

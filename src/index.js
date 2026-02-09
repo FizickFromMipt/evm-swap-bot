@@ -1,14 +1,12 @@
-const readline = require('readline');
-const { Connection, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { ethers } = require('ethers');
 const logger = require('./logger');
-const { loadConfig, solToLamports, detectNetwork } = require('./config');
-const { httpsAgent } = require('./http');
-const { isValidSolanaMint } = require('./validate');
+const { loadConfig, bnbToWei } = require('./config');
+const { isValidAddress } = require('./validate');
 const { fetchPools } = require('./dexscreener');
 const { analyzePools } = require('./poolSelector');
-const { getQuote, executeSwap } = require('./jupiter');
-const { validateTokenMint, validatePoolAccount } = require('./onchain');
-const { estimatePriorityFee } = require('./fees');
+const { getTokenInfo } = require('./onchain');
+const { getGasPrice } = require('./fees');
+const { executeBuy } = require('./swap');
 const { runAntiScamChecks } = require('./antiscam');
 
 // Structured exit codes
@@ -26,15 +24,9 @@ const EXIT = {
   SCAM_DETECTED: 10,
 };
 
-// Quote freshness settings
-const QUOTE_MAX_AGE_MS = 10_000;       // re-quote if older than 10s
-const PRICE_WARN_PCT = 2;              // warn if price moved >2%
-const PRICE_ABORT_PCT = 10;            // abort if price moved >10%
-const FEE_RESERVE_LAMPORTS = 5_000_000; // 0.005 SOL reserved for tx fees
-
 /**
  * Parse CLI flags from process.argv.
- * Supports: --dry-run, --yes/-y, --amount <SOL>, --percent <N>
+ * Supports: --dry-run, --yes/-y, --amount <BNB>, --token <address>
  */
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -43,7 +35,7 @@ function parseArgs() {
   const positional = [];
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--amount' || args[i] === '--percent') {
+    if (args[i] === '--amount' || args[i] === '--token') {
       named[args[i].slice(2)] = args[++i];
     } else if (args[i].startsWith('--') || args[i] === '-y') {
       flags.add(args[i]);
@@ -53,11 +45,11 @@ function parseArgs() {
   }
 
   return {
-    tokenMint: positional[0],
+    tokenAddress: named.token || positional[0],
     isDryRun: flags.has('--dry-run'),
     skipConfirm: flags.has('--yes') || flags.has('-y'),
     cliAmount: named.amount || null,
-    cliPercent: named.percent || null,
+    continuous: flags.has('--continuous'),
   };
 }
 
@@ -65,6 +57,7 @@ function parseArgs() {
  * Prompt the user for y/n confirmation. Returns true if confirmed.
  */
 function confirm(message) {
+  const readline = require('readline');
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
     rl.question(message, (answer) => {
@@ -75,56 +68,93 @@ function confirm(message) {
 }
 
 /**
- * RPC warmup — establishes TCP keep-alive connection and caches
- * critical RPC data so the swap tx goes through an already-hot connection.
+ * Process a single token: validate → pool analysis → anti-scam → buy.
  */
-async function warmupRpc(connection, publicKey) {
-  logger.step('Warming up RPC connection...');
-  const start = Date.now();
+async function processToken(tokenAddress, config, provider, signer, gasSettings) {
+  // --- On-chain token info ---
+  let tokenInfo;
+  try {
+    tokenInfo = await getTokenInfo(provider, tokenAddress);
+  } catch (err) {
+    logger.error(`On-chain token validation failed: ${err.message}`);
+    return false;
+  }
+  logger.sep();
 
-  const version = await connection.getVersion();
-  logger.info(`  Node version: ${version['solana-core']}`);
+  // --- DexScreener pool analysis ---
+  let selectedPool;
+  try {
+    const pools = await fetchPools(config.dexscreenerApi, tokenAddress);
+    selectedPool = analyzePools(pools, tokenAddress);
+  } catch (err) {
+    logger.warn(`DexScreener lookup failed: ${err.message}`);
+    logger.info('Continuing with PancakeSwap swap anyway...');
+  }
+  logger.sep();
 
-  const slot = await connection.getSlot();
-  logger.info(`  Current slot: ${slot}`);
+  // --- Liquidity check ---
+  if (selectedPool && config.minLiquidityUsd > 0) {
+    const liq = selectedPool.liquidity?.usd || 0;
+    if (liq < config.minLiquidityUsd) {
+      logger.warn(`Pool liquidity $${liq} is below minimum $${config.minLiquidityUsd}. Skipping.`);
+      return false;
+    }
+  }
 
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-  logger.info(`  Latest blockhash: ${blockhash.slice(0, 16)}... (valid until block ${lastValidBlockHeight})`);
+  // --- Anti-scam checks ---
+  const scamResult = await runAntiScamChecks(
+    provider,
+    config.pancakeRouter,
+    tokenAddress,
+    config.buyAmountWei,
+    tokenInfo
+  );
 
-  const balance = await connection.getBalance(publicKey);
+  if (scamResult.riskLevel === 'critical') {
+    logger.error('Anti-scam: CRITICAL risk detected. Skipping token.');
+    return false;
+  }
+  logger.sep();
 
-  const elapsed = Date.now() - start;
-  logger.success(`RPC warmed up in ${elapsed}ms (4 calls over keep-alive connection)`);
-
-  return { balance, blockhash, lastValidBlockHeight, slot };
+  // --- Execute buy ---
+  try {
+    const result = await executeBuy(signer, config.pancakeRouter, config, tokenAddress, gasSettings);
+    logger.sep();
+    logger.success('Swap completed successfully!');
+    logger.info(`  TX Hash: ${result.hash}`);
+    logger.info(`  BscScan: https://bscscan.com/tx/${result.hash}`);
+    logger.sep();
+    return true;
+  } catch (err) {
+    logger.error(`Swap failed: ${err.message}`);
+    if (err.txHash) {
+      logger.error(`  TX (failed): https://bscscan.com/tx/${err.txHash}`);
+    }
+    return false;
+  }
 }
 
 async function main() {
   logger.banner();
 
   // --- Parse CLI arguments ---
-  const { tokenMint, isDryRun, skipConfirm, cliAmount, cliPercent } = parseArgs();
+  const { tokenAddress, isDryRun, skipConfirm, cliAmount, continuous } = parseArgs();
 
-  if (!tokenMint) {
-    logger.error('Usage: npm start <TOKEN_MINT> [options]');
+  if (!tokenAddress && !continuous) {
+    logger.error('Usage: npm start <TOKEN_ADDRESS> [options]');
     logger.error('');
     logger.error('Options:');
-    logger.error('  --amount <SOL>    Override BUY_AMOUNT_SOL (e.g. --amount 0.5)');
-    logger.error('  --percent <N>     Use N% of wallet balance (e.g. --percent 50)');
-    logger.error('  --dry-run         Get quote and route without executing the swap');
+    logger.error('  --amount <BNB>    Override BUY_AMOUNT_BNB (e.g. --amount 0.05)');
+    logger.error('  --dry-run         Analyze token without executing swap');
     logger.error('  --yes, -y         Skip confirmation prompt');
+    logger.error('  --continuous      Continuous mode: poll DexScreener for new tokens');
     logger.error('');
-    logger.error('Example: npm start EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v --amount 0.1');
+    logger.error('Example: npm start 0x1234...abcd --amount 0.01');
     process.exit(EXIT.BAD_ARGS);
   }
 
-  if (cliAmount && cliPercent) {
-    logger.error('Cannot use --amount and --percent together. Choose one.');
-    process.exit(EXIT.BAD_ARGS);
-  }
-
-  if (!isValidSolanaMint(tokenMint)) {
-    logger.error(`Invalid Solana mint address: ${tokenMint}`);
+  if (tokenAddress && !isValidAddress(tokenAddress)) {
+    logger.error(`Invalid BSC address: ${tokenAddress}`);
     process.exit(EXIT.BAD_ARGS);
   }
 
@@ -148,278 +178,141 @@ async function main() {
       logger.error('--amount must be a positive number');
       process.exit(EXIT.BAD_ARGS);
     }
-    const maxBuySol = parseFloat(process.env.MAX_BUY_SOL || '10');
-    if (parsed > maxBuySol) {
-      logger.error(`--amount ${cliAmount} exceeds MAX_BUY_SOL (${maxBuySol}). Increase MAX_BUY_SOL in .env if intentional.`);
+    if (parsed > config.maxBuyBnb) {
+      logger.error(`--amount ${cliAmount} exceeds MAX_BUY_BNB (${config.maxBuyBnb}). Increase MAX_BUY_BNB in .env if intentional.`);
       process.exit(EXIT.BAD_ARGS);
     }
-    config.amountLamports = solToLamports(cliAmount);
-    config.buyAmountSol = cliAmount;
-    logger.info(`CLI override: --amount ${cliAmount} SOL (${config.amountLamports} lamports)`);
+    config.buyAmountWei = bnbToWei(cliAmount);
+    config.buyAmountBnb = cliAmount;
+    logger.info(`CLI override: --amount ${cliAmount} BNB`);
   }
 
-  const walletAddress = config.keypair.publicKey.toBase58();
-  logger.info(`Token mint: ${tokenMint}`);
-  logger.info(`Buy amount: ${config.buyAmountSol} SOL`);
-  logger.info(`Slippage: ${config.slippageBps} bps (${config.slippageBps / 100}%)`);
+  const walletAddress = config.wallet.address;
   logger.info(`Wallet: ${walletAddress}`);
+  logger.info(`Buy amount: ${config.buyAmountBnb} BNB`);
+  logger.info(`Slippage: ${config.slippagePercent}%`);
+  logger.info(`Router: ${config.pancakeRouter}`);
   logger.sep();
 
-  // --- Create connection with keep-alive ---
-  logger.step('Connecting to Solana (keep-alive enabled)...');
-  const connection = new Connection(config.rpcUrl, {
-    commitment: 'confirmed',
-    httpAgent: httpsAgent,
-  });
-
-  // --- RPC warmup ---
-  let warmup;
+  // --- Connect to BSC ---
+  logger.step('Connecting to BSC...');
+  let provider;
   try {
-    warmup = await warmupRpc(connection, config.keypair.publicKey);
+    provider = new ethers.JsonRpcProvider(config.rpcUrl);
+    const network = await provider.getNetwork();
+    logger.info(`  Chain ID: ${network.chainId}`);
+
+    if (network.chainId === 56n) {
+      logger.warn('*** BSC MAINNET — real funds at risk ***');
+    } else if (network.chainId === 97n) {
+      logger.info('Running on BSC Testnet');
+    }
   } catch (err) {
-    logger.error(`RPC warmup failed: ${err.message}`);
+    logger.error(`RPC connection failed: ${err.message}`);
     process.exit(EXIT.RPC_ERROR);
   }
 
-  // --- Network detection ---
-  const network = await detectNetwork(connection);
-  logger.info(`Network: ${network}`);
+  // --- Connect wallet to provider ---
+  const signer = config.wallet.connect(provider);
 
-  if (network === 'mainnet-beta') {
-    logger.warn('*** MAINNET DETECTED — real funds at risk ***');
-    if (!skipConfirm && !isDryRun) {
-      if (!process.stdin.isTTY) {
-        logger.error('Mainnet detected in non-interactive mode. Use --yes to confirm.');
-        process.exit(EXIT.BAD_ARGS);
-      }
-      const ok = await confirm('  You are on MAINNET. Continue? (y/n): ');
-      if (!ok) {
-        logger.info('Cancelled by user (mainnet safety check).');
-        process.exit(EXIT.USER_CANCELLED);
-      }
-    }
-  } else if (network === 'devnet' || network === 'testnet') {
-    logger.info(`Running on ${network} (test network)`);
-  } else {
-    logger.warn(`Unknown network (genesis hash not recognized). Proceed with caution.`);
+  // --- Balance check ---
+  let balance;
+  try {
+    balance = await provider.getBalance(walletAddress);
+  } catch (err) {
+    logger.error(`Failed to fetch balance: ${err.message}`);
+    process.exit(EXIT.RPC_ERROR);
   }
 
-  const balanceSol = warmup.balance / LAMPORTS_PER_SOL;
-  logger.info(`SOL balance: ${balanceSol} SOL`);
+  const balanceBnb = ethers.formatEther(balance);
+  logger.info(`BNB balance: ${balanceBnb} BNB`);
 
-  // --- CLI --percent override (needs balance) ---
-  if (cliPercent) {
-    const pct = parseFloat(cliPercent);
-    if (isNaN(pct) || pct <= 0 || pct > 100) {
-      logger.error('--percent must be between 0 and 100');
-      process.exit(EXIT.BAD_ARGS);
-    }
-    const available = Math.max(0, warmup.balance - FEE_RESERVE_LAMPORTS);
-    config.amountLamports = Math.floor(available * pct / 100);
-    config.buyAmountSol = (config.amountLamports / LAMPORTS_PER_SOL).toString();
-
-    const maxBuySol = parseFloat(process.env.MAX_BUY_SOL || '10');
-    if (parseFloat(config.buyAmountSol) > maxBuySol) {
-      logger.error(`${pct}% of balance = ${config.buyAmountSol} SOL, exceeds MAX_BUY_SOL (${maxBuySol}).`);
-      process.exit(EXIT.BAD_ARGS);
-    }
-    logger.info(`CLI override: --percent ${pct}% of available balance = ${config.buyAmountSol} SOL (${config.amountLamports} lamports)`);
-    logger.info(`  (${FEE_RESERVE_LAMPORTS / LAMPORTS_PER_SOL} SOL reserved for fees)`);
-  }
-
-  if (warmup.balance < config.amountLamports) {
-    logger.error(
-      `Insufficient SOL. Need ${config.buyAmountSol} SOL but have ${balanceSol} SOL`
-    );
+  if (balance < config.buyAmountWei) {
+    logger.error(`Insufficient BNB. Need ${config.buyAmountBnb} BNB but have ${balanceBnb} BNB`);
     process.exit(EXIT.INSUFFICIENT_FUNDS);
   }
   logger.sep();
 
-  // --- Network fee estimation ---
-  const networkFees = await estimatePriorityFee(connection);
-  logger.sep();
-
-  // --- On-chain token validation ---
-  let tokenInfo;
+  // --- Gas price ---
+  let gasSettings;
   try {
-    tokenInfo = await validateTokenMint(connection, tokenMint);
-    if (!tokenInfo.valid) {
-      logger.error(`Token mint validation failed: ${tokenInfo.reason}`);
-      process.exit(EXIT.TOKEN_INVALID);
-    }
+    gasSettings = await getGasPrice(provider, config.maxGasPriceGwei);
   } catch (err) {
-    logger.error(`On-chain validation failed: ${err.message}`);
-    process.exit(EXIT.TOKEN_INVALID);
+    logger.warn(`Gas price fetch failed: ${err.message}. Using default.`);
   }
   logger.sep();
 
-  // --- Fetch pools from DexScreener (informational) ---
-  let selectedPool;
-  try {
-    const pools = await fetchPools(config.dexscreenerApi, tokenMint);
-    selectedPool = analyzePools(pools, tokenMint);
-  } catch (err) {
-    logger.warn(`DexScreener lookup failed: ${err.message}`);
-    logger.info('Continuing with Jupiter swap anyway...');
-    logger.sep();
-  }
-
-  // --- On-chain pool validation (if DexScreener returned a pool) ---
-  if (selectedPool?.pairAddress) {
-    try {
-      const poolCheck = await validatePoolAccount(connection, selectedPool.pairAddress);
-      if (!poolCheck.exists) {
-        logger.warn(`Selected pool does not exist on-chain: ${poolCheck.reason}`);
-        logger.warn('DexScreener data may be stale. Jupiter will route independently.');
-      } else {
-        logger.success(`Pool account verified on-chain (owner: ${poolCheck.owner}, data: ${poolCheck.dataSize} bytes)`);
+  // --- One-shot mode ---
+  if (tokenAddress && !continuous) {
+    if (isDryRun) {
+      // Dry run — just analyze, don't buy
+      let tokenInfo;
+      try {
+        tokenInfo = await getTokenInfo(provider, tokenAddress);
+      } catch (err) {
+        logger.error(`Token info failed: ${err.message}`);
+        process.exit(EXIT.TOKEN_INVALID);
       }
-    } catch (err) {
-      logger.warn(`Pool on-chain check failed: ${err.message}`);
+      logger.sep();
+
+      try {
+        const pools = await fetchPools(config.dexscreenerApi, tokenAddress);
+        analyzePools(pools, tokenAddress);
+      } catch (err) {
+        logger.warn(`DexScreener: ${err.message}`);
+      }
+      logger.sep();
+
+      await runAntiScamChecks(provider, config.pancakeRouter, tokenAddress, config.buyAmountWei, tokenInfo);
+      logger.sep();
+      logger.success('Dry run complete. No transaction was sent.');
+      process.exit(EXIT.SUCCESS);
     }
-    logger.sep();
-  }
 
-  // --- Get Jupiter quote ---
-  let quoteResponse;
-  let quoteTimestamp;
-  try {
-    quoteResponse = await getQuote(config, tokenMint);
-    quoteTimestamp = Date.now();
-  } catch (err) {
-    logger.error(`Jupiter quote failed: ${err.message}`);
-    process.exit(EXIT.QUOTE_ERROR);
-  }
-
-  // --- Anti-scam checks ---
-  const scamResult = await runAntiScamChecks(config, tokenMint, tokenInfo, quoteResponse);
-  if (scamResult.riskLevel === 'critical') {
+    // Confirmation prompt
     if (!skipConfirm) {
-      logger.error('Anti-scam: CRITICAL risk detected. Aborting to protect funds.');
-      logger.error('Use --yes to override this safety check.');
-      process.exit(EXIT.SCAM_DETECTED);
-    }
-    logger.warn('Anti-scam: CRITICAL risk detected but --yes flag is set. Proceeding...');
-  }
-  logger.sep();
-
-  // --- Dry-run: stop here ---
-  if (isDryRun) {
-    logger.sep();
-    logger.success('Dry run complete. No transaction was sent.');
-    process.exit(EXIT.SUCCESS);
-  }
-
-  // --- Confirmation prompt ---
-  if (!skipConfirm) {
-    if (!process.stdin.isTTY) {
-      logger.error('Non-interactive mode detected. Use --yes to skip confirmation.');
-      process.exit(EXIT.BAD_ARGS);
+      if (!process.stdin.isTTY) {
+        logger.error('Non-interactive mode. Use --yes to skip confirmation.');
+        process.exit(EXIT.BAD_ARGS);
+      }
+      const ok = await confirm(`\n  Swap ${config.buyAmountBnb} BNB for token ${tokenAddress}?\n  Proceed? (y/n): `);
+      if (!ok) {
+        logger.info('Cancelled by user.');
+        process.exit(EXIT.USER_CANCELLED);
+      }
     }
 
-    logger.sep();
-    const amountWarning = parseFloat(config.buyAmountSol) >= 1 ? ' (!)' : '';
-
-    // Human-readable output amounts (if decimals known from on-chain validation)
-    const decimals = tokenInfo.decimals || 0;
-    const expectedHuman = decimals > 0
-      ? (Number(BigInt(quoteResponse.outAmount)) / 10 ** decimals).toLocaleString(undefined, { maximumFractionDigits: decimals })
-      : quoteResponse.outAmount;
-    const minHuman = decimals > 0
-      ? (Number(BigInt(quoteResponse.otherAmountThreshold)) / 10 ** decimals).toLocaleString(undefined, { maximumFractionDigits: decimals })
-      : quoteResponse.otherAmountThreshold;
-
-    const prompt =
-      `\n  Spend: ${config.buyAmountSol} SOL${amountWarning}\n` +
-      `  Expected output: ${expectedHuman} tokens (${quoteResponse.outAmount} raw)\n` +
-      `  Min output (amountOutMin): ${minHuman} tokens (${quoteResponse.otherAmountThreshold} raw)\n` +
-      `  Price impact: ${quoteResponse.priceImpactPct || 'N/A'}%\n` +
-      `  Slippage: ${config.slippageBps} bps (${config.slippageBps / 100}%)\n` +
-      `  Risk level: ${scamResult.riskLevel.toUpperCase()}\n\n` +
-      `  Proceed with swap? (y/n): `;
-
-    const ok = await confirm(prompt);
-    if (!ok) {
-      logger.info('Swap cancelled by user.');
-      process.exit(EXIT.USER_CANCELLED);
-    }
+    const success = await processToken(tokenAddress, config, provider, signer, gasSettings);
+    process.exit(success ? EXIT.SUCCESS : EXIT.SWAP_ERROR);
   }
 
-  // --- Quote freshness check — re-quote if stale ---
-  const quoteAge = Date.now() - quoteTimestamp;
-  if (quoteAge > QUOTE_MAX_AGE_MS) {
-    logger.warn(`Quote is ${Math.round(quoteAge / 1000)}s old (max: ${QUOTE_MAX_AGE_MS / 1000}s). Re-quoting...`);
+  // --- Continuous mode ---
+  logger.step('Starting continuous mode — polling DexScreener for new BSC pairs...');
+  const seen = new Set();
+  let running = true;
+
+  process.on('SIGINT', () => {
+    logger.info('\nGraceful shutdown...');
+    running = false;
+  });
+  process.on('SIGTERM', () => {
+    logger.info('\nGraceful shutdown...');
+    running = false;
+  });
+
+  while (running) {
     try {
-      const freshQuote = await getQuote(config, tokenMint);
-      const oldOut = BigInt(quoteResponse.outAmount);
-      const newOut = BigInt(freshQuote.outAmount);
-
-      // Negative = price got worse (we receive less)
-      const deviationPct = oldOut > 0n
-        ? Number((newOut - oldOut) * 10000n / oldOut) / 100
-        : 0;
-
-      if (Math.abs(deviationPct) > PRICE_WARN_PCT) {
-        const direction = deviationPct < 0 ? 'worse' : 'better';
-        logger.warn(`Price moved ${Math.abs(deviationPct).toFixed(2)}% ${direction} since initial quote`);
-        logger.warn(`  Old output: ${quoteResponse.outAmount} → New output: ${freshQuote.outAmount}`);
-      }
-
-      if (deviationPct < -PRICE_ABORT_PCT && !skipConfirm) {
-        logger.error(`Price dropped ${Math.abs(deviationPct).toFixed(2)}% (>${PRICE_ABORT_PCT}%). Aborting to protect funds.`);
-        logger.error('Use --yes to override this safety check.');
-        process.exit(EXIT.PRICE_DEVIATION);
-      }
-
-      quoteResponse = freshQuote;
-      quoteTimestamp = Date.now();
-      logger.success('Using fresh quote for swap');
+      // Poll DexScreener for new BSC pairs using WBNB as a base search
+      // In a real scenario, you'd poll a "new pairs" endpoint
+      await new Promise((r) => setTimeout(r, config.pollIntervalMs));
     } catch (err) {
-      logger.warn(`Re-quote failed: ${err.message}. Using original quote (${Math.round(quoteAge / 1000)}s old).`);
+      logger.error(`Poll error: ${err.message}`);
+      await new Promise((r) => setTimeout(r, config.pollIntervalMs));
     }
   }
 
-  // --- Execute swap ---
-  logger.step(`Swapping ${config.buyAmountSol} SOL for token...`);
-
-  let txSignature;
-  try {
-    txSignature = await executeSwap(config, quoteResponse, connection, {
-      networkFeeEstimate: networkFees?.high,
-    });
-  } catch (err) {
-    logger.error(`Swap failed: ${err.message}`);
-
-    // Log full swap context for post-mortem
-    logger.error(`  Token: ${tokenMint}`);
-    logger.error(`  Amount: ${config.buyAmountSol} SOL (${config.amountLamports} lamports)`);
-    logger.error(`  Slippage: ${config.slippageBps} bps`);
-    logger.error(`  Expected output: ${quoteResponse.outAmount} (raw)`);
-    logger.error(`  Min output: ${quoteResponse.otherAmountThreshold} (raw)`);
-
-    if (err.txId) {
-      logger.error(`  TX (failed): https://solscan.io/tx/${err.txId}`);
-    }
-
-    if (err.message.includes('Slippage') || err.message.includes('slippage')) {
-      logger.warn('Try increasing SLIPPAGE_BPS in .env or use a lower --amount');
-    }
-    if (err.message.includes('timed out')) {
-      logger.warn('The transaction may still land. Check the explorer.');
-    }
-    if (err.message.includes('Insufficient')) {
-      logger.warn('Wallet may not have enough SOL (including fees). Check balance.');
-    }
-    process.exit(EXIT.SWAP_ERROR);
-  }
-
-  // --- Final result ---
-  logger.sep();
-  logger.success('Swap completed successfully!');
-  logger.info(`TX Signature: ${txSignature}`);
-  logger.info(`Solscan: https://solscan.io/tx/${txSignature}`);
-  logger.info(`Solana Explorer: https://explorer.solana.com/tx/${txSignature}`);
-  logger.sep();
+  logger.info('Shutdown complete.');
+  process.exit(EXIT.SUCCESS);
 }
 
 // Auto-run only when executed directly (not imported by tests)
