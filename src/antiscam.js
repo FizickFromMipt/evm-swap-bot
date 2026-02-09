@@ -1,54 +1,95 @@
 const { ethers } = require('ethers');
 const logger = require('./logger');
-const { WBNB } = require('./config');
-const { ROUTER_ABI } = require('./swap');
+const { client } = require('./http');
 
 // EIP-1967 implementation slot
 const EIP1967_IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
 
+const ZEROX_HEADERS = (apiKey) => ({
+  '0x-api-key': apiKey,
+  '0x-version': 'v2',
+});
+
 /**
- * Honeypot detection via roundtrip simulation.
- * Simulates buy + sell quotes via PancakeSwap getAmountsOut.
- * If sell returns significantly less BNB than buy cost, it's suspicious.
+ * Honeypot detection via roundtrip simulation using 0x /price endpoint.
+ * Simulates buy (BNB→Token) + sell (Token→BNB) quotes.
+ * If sell fails or returns significantly less BNB, it's suspicious.
  */
-async function checkHoneypot(provider, routerAddress, tokenAddress, amountInWei) {
+async function checkHoneypot(config, tokenAddress, amountInWei) {
   logger.info('Simulating roundtrip swap to detect honeypot...');
 
   try {
-    const router = new ethers.Contract(routerAddress, ROUTER_ABI, provider);
+    // Buy simulation: BNB → Token
+    let buyData;
+    try {
+      const buyRes = await client.get(`${config.zeroxApiUrl}/swap/allowance-holder/price`, {
+        headers: ZEROX_HEADERS(config.routerZeroxApiKey),
+        params: {
+          chainId: 56,
+          sellToken: config.nativeToken,
+          buyToken: tokenAddress,
+          sellAmount: amountInWei.toString(),
+          taker: config.wallet.address,
+        },
+      });
+      buyData = buyRes.data;
+    } catch (err) {
+      return { canSell: false, reason: `Buy quote failed: ${err.message}` };
+    }
 
-    // Buy quote: BNB → Token
-    const buyPath = [WBNB, tokenAddress];
-    const buyAmounts = await router.getAmountsOut(amountInWei, buyPath);
-    const tokenReceived = buyAmounts[buyAmounts.length - 1];
+    if (buyData.liquidityAvailable === false) {
+      return { canSell: false, reason: 'No liquidity available for buy' };
+    }
 
-    if (tokenReceived === 0n) {
+    const tokenReceived = buyData.buyAmount;
+    if (!tokenReceived || tokenReceived === '0') {
       return { canSell: false, reason: 'Buy quote returned 0 tokens' };
     }
 
-    // Sell quote: Token → BNB
-    const sellPath = [tokenAddress, WBNB];
-    let sellAmounts;
+    // Sell simulation: Token → BNB
+    let sellData;
     try {
-      sellAmounts = await router.getAmountsOut(tokenReceived, sellPath);
+      const sellRes = await client.get(`${config.zeroxApiUrl}/swap/allowance-holder/price`, {
+        headers: ZEROX_HEADERS(config.routerZeroxApiKey),
+        params: {
+          chainId: 56,
+          sellToken: tokenAddress,
+          buyToken: config.nativeToken,
+          sellAmount: tokenReceived,
+          taker: config.wallet.address,
+        },
+      });
+      sellData = sellRes.data;
     } catch {
       return { canSell: false, reason: 'Sell quote failed — token may be a honeypot' };
     }
 
-    const bnbReturned = sellAmounts[sellAmounts.length - 1];
+    if (sellData.liquidityAvailable === false) {
+      return { canSell: false, reason: 'No liquidity available for sell — likely honeypot' };
+    }
+
+    const bnbReturned = BigInt(sellData.buyAmount);
+    const amountIn = BigInt(amountInWei);
 
     // Round-trip loss
     const roundTripLossPct =
-      amountInWei > 0n
-        ? Number((amountInWei - bnbReturned) * 10000n / amountInWei) / 100
+      amountIn > 0n
+        ? Number((amountIn - bnbReturned) * 10000n / amountIn) / 100
         : 0;
 
     const result = {
       canSell: true,
-      tokenReceived: tokenReceived.toString(),
-      bnbReturned: bnbReturned.toString(),
+      tokenReceived,
+      bnbReturned: sellData.buyAmount,
       roundTripLossPct,
     };
+
+    // Check sell tax from 0x token metadata
+    const sellTaxBps = buyData.tokenMetadata?.buyToken?.sellTaxBps;
+    if (sellTaxBps && parseInt(sellTaxBps) > 0) {
+      result.sellTaxPct = (parseInt(sellTaxBps) / 100).toFixed(1);
+      result.warning = `Token has sell tax: ${result.sellTaxPct}%`;
+    }
 
     if (roundTripLossPct > 50) {
       result.warning = `Extreme round-trip loss: ${roundTripLossPct.toFixed(1)}% — likely honeypot or extreme tax`;
@@ -105,14 +146,14 @@ async function checkOwnership(provider, tokenAddress) {
  *
  * @returns {{ riskLevel: string, warnings: string[], details: object }}
  */
-async function runAntiScamChecks(provider, routerAddress, tokenAddress, amountInWei, tokenInfo) {
+async function runAntiScamChecks(provider, config, tokenAddress, amountInWei, tokenInfo) {
   logger.step('Running anti-scam checks...');
 
   const warnings = [];
   const details = {};
 
   // --- Honeypot simulation ---
-  const honeypot = await checkHoneypot(provider, routerAddress, tokenAddress, amountInWei);
+  const honeypot = await checkHoneypot(config, tokenAddress, amountInWei);
   details.honeypot = honeypot;
 
   if (!honeypot.canSell) {

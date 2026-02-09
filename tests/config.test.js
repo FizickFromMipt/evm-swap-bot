@@ -81,6 +81,8 @@ describe('loadConfig', () => {
     delete process.env.GAS_LIMIT;
     delete process.env.MAX_GAS_PRICE_GWEI;
     delete process.env.MAX_BUY_BNB;
+    delete process.env.ROUTER_ZERO_X_API_KEY;
+    delete process.env.ZEROX_API_URL;
   });
 
   afterAll(() => {
@@ -90,6 +92,7 @@ describe('loadConfig', () => {
   test('throws on missing RPC_URL', () => {
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     expect(() => lc()).toThrow('RPC_URL is required');
   });
@@ -97,6 +100,7 @@ describe('loadConfig', () => {
   test('throws on missing PRIVATE_KEY', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     expect(() => lc()).toThrow('PRIVATE_KEY or PRIVATE_KEY_PATH is required');
   });
@@ -104,6 +108,7 @@ describe('loadConfig', () => {
   test('throws on missing BUY_AMOUNT_BNB', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     expect(() => lc()).toThrow('BUY_AMOUNT_BNB must be a valid number');
   });
@@ -112,6 +117,7 @@ describe('loadConfig', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '0';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     expect(() => lc()).toThrow('greater than 0');
   });
@@ -121,6 +127,7 @@ describe('loadConfig', () => {
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '5';
     process.env.MAX_BUY_BNB = '1';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     expect(() => lc()).toThrow('exceeds MAX_BUY_BNB');
   });
@@ -130,8 +137,17 @@ describe('loadConfig', () => {
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '0.01';
     process.env.SLIPPAGE_PERCENT = '60';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     expect(() => lc()).toThrow('50%');
+  });
+
+  test('throws on missing ROUTER_ZERO_X_API_KEY', () => {
+    process.env.RPC_URL = 'http://localhost:8545';
+    process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
+    process.env.BUY_AMOUNT_BNB = '0.01';
+    const { loadConfig: lc } = require('../src/config');
+    expect(() => lc()).toThrow('ROUTER_ZERO_X_API_KEY is required');
   });
 
   test('collects multiple errors', () => {
@@ -148,6 +164,7 @@ describe('loadConfig', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     const config = lc();
     expect(config.rpcUrl).toBe('http://localhost:8545');
@@ -161,6 +178,7 @@ describe('loadConfig', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     const config = lc();
     expect(config.wallet.address).toBeDefined();
@@ -170,6 +188,7 @@ describe('loadConfig', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.PRIVATE_KEY = '0x' + TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     const config = lc();
     expect(config.wallet.address).toBeDefined();
@@ -179,6 +198,7 @@ describe('loadConfig', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.PRIVATE_KEY = 'not-a-valid-key';
     process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     const { loadConfig: lc } = require('../src/config');
     expect(() => lc()).toThrow('Failed to parse PRIVATE_KEY');
   });
@@ -187,19 +207,55 @@ describe('loadConfig', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
     delete process.env.SLIPPAGE_PERCENT;
     const { loadConfig: lc } = require('../src/config');
     const config = lc();
     expect(config.slippagePercent).toBe(5);
   });
 
-  test('config includes BSC constants', () => {
+  test('config includes BSC and 0x constants', () => {
     process.env.RPC_URL = 'http://localhost:8545';
     process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
     process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'my-0x-key';
     const { loadConfig: lc } = require('../src/config');
     const config = lc();
-    expect(config.pancakeRouter).toBe('0x10ED43C718714eb63d5aA57B78B54704E256024E');
     expect(config.wbnb).toBe('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c');
+    expect(config.routerZeroxApiKey).toBe('my-0x-key');
+    expect(config.zeroxApiUrl).toBe('https://api.0x.org');
+    expect(config.nativeToken).toBe('0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE');
+  });
+
+  test('slippageBps is correctly computed from slippagePercent', () => {
+    process.env.RPC_URL = 'http://localhost:8545';
+    process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
+    process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
+    process.env.SLIPPAGE_PERCENT = '5.5';
+    const { loadConfig: lc } = require('../src/config');
+    const config = lc();
+    expect(config.slippageBps).toBe(550);
+  });
+
+  test('slippageBps defaults to 500 (5%)', () => {
+    process.env.RPC_URL = 'http://localhost:8545';
+    process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
+    process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
+    const { loadConfig: lc } = require('../src/config');
+    const config = lc();
+    expect(config.slippageBps).toBe(500);
+  });
+
+  test('uses custom ZEROX_API_URL when set', () => {
+    process.env.RPC_URL = 'http://localhost:8545';
+    process.env.PRIVATE_KEY = TEST_PRIVATE_KEY;
+    process.env.BUY_AMOUNT_BNB = '0.01';
+    process.env.ROUTER_ZERO_X_API_KEY = 'test-key';
+    process.env.ZEROX_API_URL = 'https://custom.api.0x.org';
+    const { loadConfig: lc } = require('../src/config');
+    const config = lc();
+    expect(config.zeroxApiUrl).toBe('https://custom.api.0x.org');
   });
 });

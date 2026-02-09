@@ -6,7 +6,7 @@ const { fetchPools } = require('./dexscreener');
 const { analyzePools } = require('./poolSelector');
 const { getTokenInfo } = require('./onchain');
 const { getGasPrice } = require('./fees');
-const { executeBuy } = require('./swap');
+const { executeBuy, formatRoute } = require('./swap');
 const { runAntiScamChecks } = require('./antiscam');
 
 // Structured exit codes
@@ -88,7 +88,7 @@ async function processToken(tokenAddress, config, provider, signer, gasSettings)
     selectedPool = analyzePools(pools, tokenAddress);
   } catch (err) {
     logger.warn(`DexScreener lookup failed: ${err.message}`);
-    logger.info('Continuing with PancakeSwap swap anyway...');
+    logger.info('Continuing with 0x aggregator swap anyway...');
   }
   logger.sep();
 
@@ -104,7 +104,7 @@ async function processToken(tokenAddress, config, provider, signer, gasSettings)
   // --- Anti-scam checks ---
   const scamResult = await runAntiScamChecks(
     provider,
-    config.pancakeRouter,
+    config,
     tokenAddress,
     config.buyAmountWei,
     tokenInfo
@@ -118,11 +118,14 @@ async function processToken(tokenAddress, config, provider, signer, gasSettings)
 
   // --- Execute buy ---
   try {
-    const result = await executeBuy(signer, config.pancakeRouter, config, tokenAddress, gasSettings);
+    const result = await executeBuy(signer, config, tokenAddress, gasSettings);
     logger.sep();
     logger.success('Swap completed successfully!');
     logger.info(`  TX Hash: ${result.hash}`);
     logger.info(`  BscScan: https://bscscan.com/tx/${result.hash}`);
+    if (result.route) {
+      logger.info(`  Route: ${formatRoute(result.route)}`);
+    }
     logger.sep();
     return true;
   } catch (err) {
@@ -190,8 +193,8 @@ async function main() {
   const walletAddress = config.wallet.address;
   logger.info(`Wallet: ${walletAddress}`);
   logger.info(`Buy amount: ${config.buyAmountBnb} BNB`);
-  logger.info(`Slippage: ${config.slippagePercent}%`);
-  logger.info(`Router: ${config.pancakeRouter}`);
+  logger.info(`Slippage: ${config.slippagePercent}% (${config.slippageBps} bps)`);
+  logger.info(`Swap via: 0x aggregator`);
   logger.sep();
 
   // --- Connect to BSC ---
@@ -263,7 +266,7 @@ async function main() {
       }
       logger.sep();
 
-      await runAntiScamChecks(provider, config.pancakeRouter, tokenAddress, config.buyAmountWei, tokenInfo);
+      await runAntiScamChecks(provider, config, tokenAddress, config.buyAmountWei, tokenInfo);
       logger.sep();
       logger.success('Dry run complete. No transaction was sent.');
       process.exit(EXIT.SUCCESS);

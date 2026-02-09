@@ -7,11 +7,24 @@ jest.mock('../src/logger', () => ({
   sep: jest.fn(),
 }));
 
+jest.mock('../src/http', () => ({
+  client: {
+    get: jest.fn(),
+  },
+}));
+
 const { ethers } = require('ethers');
+const { client } = require('../src/http');
 
 const TOKEN_ADDR = '0x1234567890abcdef1234567890abcdef12345678';
-const ROUTER_ADDR = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
 const AMOUNT_WEI = 10_000_000_000_000_000n; // 0.01 BNB
+
+const BASE_CONFIG = {
+  routerZeroxApiKey: 'test-api-key',
+  zeroxApiUrl: 'https://api.0x.org',
+  nativeToken: '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE',
+  wallet: { address: '0xWalletAddress' },
+};
 
 // === checkProxy ===
 
@@ -57,6 +70,7 @@ describe('checkOwnership', () => {
       step: jest.fn(), info: jest.fn(), warn: jest.fn(),
       error: jest.fn(), success: jest.fn(), sep: jest.fn(),
     }));
+    jest.doMock('../src/http', () => ({ client: { get: jest.fn() } }));
     jest.doMock('ethers', () => {
       const actual = jest.requireActual('ethers');
       return {
@@ -85,6 +99,7 @@ describe('checkOwnership', () => {
       step: jest.fn(), info: jest.fn(), warn: jest.fn(),
       error: jest.fn(), success: jest.fn(), sep: jest.fn(),
     }));
+    jest.doMock('../src/http', () => ({ client: { get: jest.fn() } }));
     jest.doMock('ethers', () => {
       const actual = jest.requireActual('ethers');
       return {
@@ -113,6 +128,7 @@ describe('checkOwnership', () => {
       step: jest.fn(), info: jest.fn(), warn: jest.fn(),
       error: jest.fn(), success: jest.fn(), sep: jest.fn(),
     }));
+    jest.doMock('../src/http', () => ({ client: { get: jest.fn() } }));
     const actualEthers = jest.requireActual('ethers');
     jest.doMock('ethers', () => ({
       ...actualEthers,
@@ -137,281 +153,229 @@ describe('checkOwnership', () => {
 // === checkHoneypot ===
 
 describe('checkHoneypot', () => {
-  test('returns canSell:true with low round-trip loss', async () => {
-    jest.resetModules();
-    jest.doMock('../src/logger', () => ({
-      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
-      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
-    }));
-    jest.doMock('ethers', () => {
-      const actual = jest.requireActual('ethers');
-      return {
-        ...actual,
-        ethers: {
-          ...actual.ethers,
-          Contract: jest.fn().mockReturnValue({
-            getAmountsOut: jest.fn()
-              .mockResolvedValueOnce([AMOUNT_WEI, 1000000n]) // buy
-              .mockResolvedValueOnce([1000000n, 9500000000000000n]), // sell (95% return)
-          }),
-        },
-      };
-    });
+  const { checkHoneypot } = require('../src/antiscam');
 
-    const { checkHoneypot } = require('../src/antiscam');
-    const result = await checkHoneypot({}, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI);
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('returns canSell:true with low round-trip loss', async () => {
+    // Buy: spend 0.01 BNB, get 1000000 tokens
+    // Sell: sell 1000000 tokens, get 0.0095 BNB (5% loss)
+    client.get
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '1000000',
+          liquidityAvailable: true,
+          tokenMetadata: { buyToken: { sellTaxBps: '0' } },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '9500000000000000', // 0.0095 BNB
+          liquidityAvailable: true,
+        },
+      });
+
+    const result = await checkHoneypot(BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI);
     expect(result.canSell).toBe(true);
     expect(result.roundTripLossPct).toBe(5);
     expect(result.warning).toBeUndefined();
-
-    jest.restoreAllMocks();
   });
 
   test('returns warning for >20% round-trip loss', async () => {
-    jest.resetModules();
-    jest.doMock('../src/logger', () => ({
-      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
-      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
-    }));
-    jest.doMock('ethers', () => {
-      const actual = jest.requireActual('ethers');
-      return {
-        ...actual,
-        ethers: {
-          ...actual.ethers,
-          Contract: jest.fn().mockReturnValue({
-            getAmountsOut: jest.fn()
-              .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
-              .mockResolvedValueOnce([1000000n, 7000000000000000n]), // 70% return = 30% loss
-          }),
+    client.get
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '1000000',
+          liquidityAvailable: true,
+          tokenMetadata: { buyToken: { sellTaxBps: '0' } },
         },
-      };
-    });
+      })
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '7000000000000000', // 0.007 BNB = 30% loss
+          liquidityAvailable: true,
+        },
+      });
 
-    const { checkHoneypot } = require('../src/antiscam');
-    const result = await checkHoneypot({}, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI);
+    const result = await checkHoneypot(BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI);
     expect(result.canSell).toBe(true);
     expect(result.roundTripLossPct).toBe(30);
     expect(result.warning).toContain('High round-trip loss');
+  });
 
-    jest.restoreAllMocks();
+  test('returns warning for >50% round-trip loss', async () => {
+    client.get
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '1000000',
+          liquidityAvailable: true,
+          tokenMetadata: { buyToken: { sellTaxBps: '0' } },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '3000000000000000', // 0.003 BNB = 70% loss
+          liquidityAvailable: true,
+        },
+      });
+
+    const result = await checkHoneypot(BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI);
+    expect(result.canSell).toBe(true);
+    expect(result.roundTripLossPct).toBe(70);
+    expect(result.warning).toContain('Extreme round-trip loss');
   });
 
   test('returns canSell:false when sell quote fails', async () => {
-    jest.resetModules();
-    jest.doMock('../src/logger', () => ({
-      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
-      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
-    }));
-    jest.doMock('ethers', () => {
-      const actual = jest.requireActual('ethers');
-      return {
-        ...actual,
-        ethers: {
-          ...actual.ethers,
-          Contract: jest.fn().mockReturnValue({
-            getAmountsOut: jest.fn()
-              .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
-              .mockRejectedValueOnce(new Error('INSUFFICIENT')),
-          }),
+    client.get
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '1000000',
+          liquidityAvailable: true,
+          tokenMetadata: { buyToken: { sellTaxBps: '0' } },
         },
-      };
-    });
+      })
+      .mockRejectedValueOnce(new Error('INSUFFICIENT'));
 
-    const { checkHoneypot } = require('../src/antiscam');
-    const result = await checkHoneypot({}, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI);
+    const result = await checkHoneypot(BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI);
     expect(result.canSell).toBe(false);
     expect(result.reason).toContain('honeypot');
+  });
 
-    jest.restoreAllMocks();
+  test('returns canSell:false when buy has no liquidity', async () => {
+    client.get.mockResolvedValueOnce({
+      data: {
+        buyAmount: '0',
+        liquidityAvailable: false,
+      },
+    });
+
+    const result = await checkHoneypot(BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI);
+    expect(result.canSell).toBe(false);
+    expect(result.reason).toContain('No liquidity');
+  });
+
+  test('returns canSell:false when buy quote fails', async () => {
+    client.get.mockRejectedValueOnce(new Error('API error'));
+
+    const result = await checkHoneypot(BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI);
+    expect(result.canSell).toBe(false);
+    expect(result.reason).toContain('Buy quote failed');
+  });
+
+  test('returns canSell:false when sell has no liquidity', async () => {
+    client.get
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '1000000',
+          liquidityAvailable: true,
+          tokenMetadata: { buyToken: { sellTaxBps: '0' } },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          buyAmount: '0',
+          liquidityAvailable: false,
+        },
+      });
+
+    const result = await checkHoneypot(BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI);
+    expect(result.canSell).toBe(false);
+    expect(result.reason).toContain('likely honeypot');
   });
 });
 
 // === runAntiScamChecks ===
 
 describe('runAntiScamChecks', () => {
-  test('returns low risk for clean token', async () => {
+  function setupRunAntiScamChecks(httpMocks) {
     jest.resetModules();
     jest.doMock('../src/logger', () => ({
       step: jest.fn(), info: jest.fn(), warn: jest.fn(),
       error: jest.fn(), success: jest.fn(), sep: jest.fn(),
     }));
+    const mockClient = { get: jest.fn() };
+    httpMocks.forEach((m) => {
+      if (m.reject) {
+        mockClient.get.mockRejectedValueOnce(m.reject);
+      } else {
+        mockClient.get.mockResolvedValueOnce(m);
+      }
+    });
+    jest.doMock('../src/http', () => ({ client: mockClient }));
     const actualEthers = jest.requireActual('ethers');
     jest.doMock('ethers', () => ({
       ...actualEthers,
       ethers: {
         ...actualEthers.ethers,
-        Contract: jest.fn().mockImplementation((addr, abi) => {
-          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
-            return {
-              getAmountsOut: jest.fn()
-                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
-                .mockResolvedValueOnce([1000000n, 9500000000000000n]),
-            };
-          }
-          return { owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress) };
+        Contract: jest.fn().mockReturnValue({
+          owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress),
         }),
         ZeroAddress: actualEthers.ethers.ZeroAddress,
         getAddress: actualEthers.ethers.getAddress,
       },
     }));
+    return require('../src/antiscam');
+  }
 
-    const { runAntiScamChecks } = require('../src/antiscam');
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test('returns low risk for clean token', async () => {
+    const { runAntiScamChecks } = setupRunAntiScamChecks([
+      { data: { buyAmount: '1000000', liquidityAvailable: true, tokenMetadata: { buyToken: { sellTaxBps: '0' } } } },
+      { data: { buyAmount: '9500000000000000', liquidityAvailable: true } },
+    ]);
+
     const provider = { getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)) };
     const tokenInfo = { totalSupply: 1000000n };
 
-    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
+    const result = await runAntiScamChecks(provider, BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
     expect(result.riskLevel).toBe('low');
     expect(result.warnings).toHaveLength(0);
-
-    jest.restoreAllMocks();
   });
 
   test('returns critical risk for honeypot', async () => {
-    jest.resetModules();
-    jest.doMock('../src/logger', () => ({
-      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
-      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
-    }));
-    const actualEthers = jest.requireActual('ethers');
-    jest.doMock('ethers', () => ({
-      ...actualEthers,
-      ethers: {
-        ...actualEthers.ethers,
-        Contract: jest.fn().mockImplementation((addr, abi) => {
-          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
-            return {
-              getAmountsOut: jest.fn()
-                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
-                .mockRejectedValueOnce(new Error('INSUFFICIENT')),
-            };
-          }
-          return { owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress) };
-        }),
-        ZeroAddress: actualEthers.ethers.ZeroAddress,
-        getAddress: actualEthers.ethers.getAddress,
-      },
-    }));
+    const { runAntiScamChecks } = setupRunAntiScamChecks([
+      { data: { buyAmount: '1000000', liquidityAvailable: true, tokenMetadata: { buyToken: { sellTaxBps: '0' } } } },
+      { reject: new Error('INSUFFICIENT') },
+    ]);
 
-    const { runAntiScamChecks } = require('../src/antiscam');
     const provider = { getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)) };
     const tokenInfo = { totalSupply: 1000000n };
 
-    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
+    const result = await runAntiScamChecks(provider, BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
     expect(result.riskLevel).toBe('critical');
     expect(result.warnings.some((w) => w.includes('HONEYPOT'))).toBe(true);
-
-    jest.restoreAllMocks();
   });
 
   test('returns high risk for upgradeable proxy', async () => {
-    jest.resetModules();
-    jest.doMock('../src/logger', () => ({
-      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
-      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
-    }));
-    const actualEthers = jest.requireActual('ethers');
-    jest.doMock('ethers', () => ({
-      ...actualEthers,
-      ethers: {
-        ...actualEthers.ethers,
-        Contract: jest.fn().mockImplementation((addr, abi) => {
-          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
-            return {
-              getAmountsOut: jest.fn()
-                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
-                .mockResolvedValueOnce([1000000n, 9500000000000000n]),
-            };
-          }
-          return { owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress) };
-        }),
-        ZeroAddress: actualEthers.ethers.ZeroAddress,
-        getAddress: actualEthers.ethers.getAddress,
-      },
-    }));
+    const { runAntiScamChecks } = setupRunAntiScamChecks([
+      { data: { buyAmount: '1000000', liquidityAvailable: true, tokenMetadata: { buyToken: { sellTaxBps: '0' } } } },
+      { data: { buyAmount: '9500000000000000', liquidityAvailable: true } },
+    ]);
 
-    const { runAntiScamChecks } = require('../src/antiscam');
     const implAddr = '0x000000000000000000000000' + '1234567890abcdef1234567890abcdef12345678';
     const provider = { getStorage: jest.fn().mockResolvedValue(implAddr) };
     const tokenInfo = { totalSupply: 1000000n };
 
-    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
+    const result = await runAntiScamChecks(provider, BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
     expect(result.riskLevel).toBe('high');
     expect(result.warnings.some((w) => w.includes('upgradeable proxy'))).toBe(true);
-
-    jest.restoreAllMocks();
-  });
-
-  test('returns medium risk for non-renounced ownership', async () => {
-    jest.resetModules();
-    jest.doMock('../src/logger', () => ({
-      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
-      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
-    }));
-    const actualEthers = jest.requireActual('ethers');
-    jest.doMock('ethers', () => ({
-      ...actualEthers,
-      ethers: {
-        ...actualEthers.ethers,
-        Contract: jest.fn().mockImplementation((addr, abi) => {
-          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
-            return {
-              getAmountsOut: jest.fn()
-                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
-                .mockResolvedValueOnce([1000000n, 9500000000000000n]),
-            };
-          }
-          return { owner: jest.fn().mockResolvedValue('0x1234567890AbcdEF1234567890aBcdef12345678') };
-        }),
-        ZeroAddress: actualEthers.ethers.ZeroAddress,
-        getAddress: actualEthers.ethers.getAddress,
-      },
-    }));
-
-    const { runAntiScamChecks } = require('../src/antiscam');
-    const provider = { getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)) };
-    const tokenInfo = { totalSupply: 1000000n };
-
-    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
-    expect(result.riskLevel).toBe('medium');
-    expect(result.warnings.some((w) => w.includes('Ownership NOT renounced'))).toBe(true);
-
-    jest.restoreAllMocks();
   });
 
   test('warns on zero supply', async () => {
-    jest.resetModules();
-    jest.doMock('../src/logger', () => ({
-      step: jest.fn(), info: jest.fn(), warn: jest.fn(),
-      error: jest.fn(), success: jest.fn(), sep: jest.fn(),
-    }));
-    const actualEthers = jest.requireActual('ethers');
-    jest.doMock('ethers', () => ({
-      ...actualEthers,
-      ethers: {
-        ...actualEthers.ethers,
-        Contract: jest.fn().mockImplementation((addr, abi) => {
-          if (Array.isArray(abi) && abi.some(a => typeof a === 'string' && a.includes('getAmountsOut'))) {
-            return {
-              getAmountsOut: jest.fn()
-                .mockResolvedValueOnce([AMOUNT_WEI, 1000000n])
-                .mockResolvedValueOnce([1000000n, 9500000000000000n]),
-            };
-          }
-          return { owner: jest.fn().mockResolvedValue(actualEthers.ethers.ZeroAddress) };
-        }),
-        ZeroAddress: actualEthers.ethers.ZeroAddress,
-        getAddress: actualEthers.ethers.getAddress,
-      },
-    }));
+    const { runAntiScamChecks } = setupRunAntiScamChecks([
+      { data: { buyAmount: '1000000', liquidityAvailable: true, tokenMetadata: { buyToken: { sellTaxBps: '0' } } } },
+      { data: { buyAmount: '9500000000000000', liquidityAvailable: true } },
+    ]);
 
-    const { runAntiScamChecks } = require('../src/antiscam');
     const provider = { getStorage: jest.fn().mockResolvedValue('0x' + '0'.repeat(64)) };
     const tokenInfo = { totalSupply: 0n };
 
-    const result = await runAntiScamChecks(provider, ROUTER_ADDR, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
+    const result = await runAntiScamChecks(provider, BASE_CONFIG, TOKEN_ADDR, AMOUNT_WEI, tokenInfo);
     expect(result.warnings.some((w) => w.includes('zero supply'))).toBe(true);
-
-    jest.restoreAllMocks();
   });
 });

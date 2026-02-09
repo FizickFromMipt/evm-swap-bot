@@ -133,6 +133,36 @@ describe('validatePool', () => {
     const result = validatePool(pool, TARGET_ADDR);
     expect(result.valid).toBe(true);
   });
+
+  test('passes pool on PancakeSwap V3', () => {
+    const pool = makePool({ dexId: 'pancakeswap-v3' });
+    const result = validatePool(pool, TARGET_ADDR);
+    expect(result.valid).toBe(true);
+  });
+
+  test('passes pool on Uniswap V3', () => {
+    const pool = makePool({ dexId: 'uniswap-v3' });
+    const result = validatePool(pool, TARGET_ADDR);
+    expect(result.valid).toBe(true);
+  });
+
+  test('passes pool on Thena', () => {
+    const pool = makePool({ dexId: 'thena' });
+    const result = validatePool(pool, TARGET_ADDR);
+    expect(result.valid).toBe(true);
+  });
+
+  test('passes pool on SushiSwap', () => {
+    const pool = makePool({ dexId: 'sushiswap' });
+    const result = validatePool(pool, TARGET_ADDR);
+    expect(result.valid).toBe(true);
+  });
+
+  test('passes pool on PancakeSwap V4', () => {
+    const pool = makePool({ dexId: 'pancakeswap-v4' });
+    const result = validatePool(pool, TARGET_ADDR);
+    expect(result.valid).toBe(true);
+  });
 });
 
 // === scorePool ===

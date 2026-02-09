@@ -1,112 +1,131 @@
-const { ethers } = require('ethers');
 const logger = require('./logger');
-const { WBNB } = require('./config');
+const { client } = require('./http');
+const { withRetry } = require('./retry');
 
-const ROUTER_ABI = [
-  'function getAmountsOut(uint256 amountIn, address[] path) view returns (uint256[])',
-  'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable',
-];
-
-const SWAP_DEADLINE_SEC = 300; // 5 minutes
+const ZEROX_HEADERS = (apiKey) => ({
+  '0x-api-key': apiKey,
+  '0x-version': 'v2',
+});
 
 /**
- * Get a quote from PancakeSwap V2 Router via getAmountsOut.
- * Returns the expected output amount as BigInt.
+ * Get a price quote from 0x API (no calldata, just pricing info).
+ * Used for estimations and honeypot simulation.
  */
-async function getQuote(router, amountInWei, path) {
-  const amounts = await router.getAmountsOut(amountInWei, path);
-  return amounts[amounts.length - 1];
+async function getQuote(config, sellToken, buyToken, sellAmount, taker) {
+  const { data } = await client.get(`${config.zeroxApiUrl}/swap/allowance-holder/price`, {
+    headers: ZEROX_HEADERS(config.routerZeroxApiKey),
+    params: {
+      chainId: 56,
+      sellToken,
+      buyToken,
+      sellAmount: sellAmount.toString(),
+      taker,
+    },
+  });
+  return data;
 }
 
 /**
- * Apply slippage to a quote amount.
- * Uses 10000-based precision to support fractional percents (e.g. 5.5%).
+ * Format route fills for logging.
+ * Example: "PancakeSwap_V2 (60%) + DODO (40%)"
  */
-function applySlippage(expectedOut, slippagePercent) {
-  const bps = BigInt(Math.round(slippagePercent * 100)); // 5% → 500, 5.5% → 550
-  return expectedOut * (10000n - bps) / 10000n;
+function formatRoute(route) {
+  if (!route?.fills?.length) return 'unknown';
+  return route.fills
+    .map((f) => `${f.source} (${(parseFloat(f.proportionBps) / 100).toFixed(0)}%)`)
+    .join(' + ');
 }
 
 /**
- * Execute a buy swap via PancakeSwap V2 Router.
+ * Execute a buy swap via 0x Swap API v2.
  *
- * Uses swapExactETHForTokensSupportingFeeOnTransferTokens
- * to handle fee-on-transfer / deflationary tokens safely.
- * Retries up to config.buyRetries times with config.buyRetryDelayMs delay.
+ * 1. GET /swap/allowance-holder/quote with retry
+ * 2. Check liquidityAvailable
+ * 3. wallet.sendTransaction({ to, data, value, gasLimit })
+ * 4. tx.wait() → check receipt.status
  *
- * @returns {{ hash: string, amountOutMin: BigInt, expectedOut: BigInt }}
+ * @returns {{ hash: string, buyAmount: string, minBuyAmount: string, route: object }}
  */
-async function executeBuy(wallet, routerAddress, config, tokenAddress, gasSettings) {
-  logger.step(`Swapping ${config.buyAmountBnb} BNB for token...`);
+async function executeBuy(wallet, config, tokenAddress, gasSettings) {
+  logger.step(`Swapping ${config.buyAmountBnb} BNB for token via 0x...`);
 
-  const router = new ethers.Contract(routerAddress, ROUTER_ABI, wallet);
-  const path = [WBNB, tokenAddress];
-  const amountInWei = config.buyAmountWei;
-  const maxAttempts = (config.buyRetries || 0) + 1;
-  const retryDelay = config.buyRetryDelayMs || 500;
+  const sellAmount = config.buyAmountWei;
 
-  // Get quote
-  logger.info('Getting quote from PancakeSwap...');
-  const expectedOut = await getQuote(router, amountInWei, path);
-  logger.info(`  Expected output: ${expectedOut.toString()} (raw)`);
-
-  // Apply slippage (bps-based for fractional precision)
-  const amountOutMin = applySlippage(expectedOut, config.slippagePercent);
-  logger.info(`  Min output (after ${config.slippagePercent}% slippage): ${amountOutMin.toString()}`);
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      // Deadline refreshed each attempt
-      const deadline = Math.floor(Date.now() / 1000) + SWAP_DEADLINE_SEC;
-
-      // Build tx
-      const txOverrides = {
-        value: amountInWei,
-        gasLimit: config.gasLimit,
-      };
-
-      if (gasSettings?.gasPrice) {
-        txOverrides.gasPrice = gasSettings.gasPrice;
-      }
-
-      if (attempt > 1) {
-        logger.info(`Retry attempt ${attempt}/${maxAttempts}...`);
-      }
-
-      logger.info('Sending swap transaction...');
-      const tx = await router.swapExactETHForTokensSupportingFeeOnTransferTokens(
-        amountOutMin,
-        path,
-        wallet.address,
-        deadline,
-        txOverrides
-      );
-
-      logger.info(`  TX Hash: ${tx.hash}`);
-      logger.info('Waiting for confirmation...');
-
-      const receipt = await tx.wait();
-
-      if (receipt.status === 0) {
-        const error = new Error('Transaction reverted on-chain');
-        error.txHash = tx.hash;
-        throw error;
-      }
-
-      logger.success('Swap confirmed!');
-      logger.info(`  Block: ${receipt.blockNumber}`);
-      logger.info(`  Gas used: ${receipt.gasUsed.toString()}`);
-
-      return { hash: tx.hash, amountOutMin, expectedOut };
-    } catch (err) {
-      // Don't retry on-chain reverts — they will revert again
-      if (err.txHash || attempt === maxAttempts) {
-        throw err;
-      }
-      logger.warn(`Swap attempt ${attempt} failed: ${err.message}. Retrying in ${retryDelay}ms...`);
-      await new Promise((r) => setTimeout(r, retryDelay));
+  // 1. Get quote with calldata from 0x
+  logger.info('Getting quote from 0x aggregator...');
+  const quote = await withRetry(
+    () =>
+      client.get(`${config.zeroxApiUrl}/swap/allowance-holder/quote`, {
+        headers: ZEROX_HEADERS(config.routerZeroxApiKey),
+        params: {
+          chainId: 56,
+          sellToken: config.nativeToken,
+          buyToken: tokenAddress,
+          sellAmount: sellAmount.toString(),
+          taker: wallet.address,
+          slippageBps: config.slippageBps,
+        },
+      }),
+    {
+      retries: config.buyRetries || 3,
+      baseDelay: config.buyRetryDelayMs || 500,
+      onRetry: (attempt, delay, err) => {
+        logger.warn(`Quote attempt ${attempt} failed: ${err.message}. Retrying in ${delay}ms...`);
+      },
     }
+  ).then((res) => res.data);
+
+  // 2. Check liquidity
+  if (quote.liquidityAvailable === false) {
+    throw new Error('No liquidity available for this token on any DEX');
   }
+
+  logger.info(`  Buy amount: ${quote.buyAmount} (raw)`);
+  logger.info(`  Min buy amount: ${quote.minBuyAmount}`);
+  logger.info(`  Route: ${formatRoute(quote.route)}`);
+
+  // Check sell tax from token metadata
+  const sellTaxBps = quote.tokenMetadata?.buyToken?.sellTaxBps;
+  if (sellTaxBps && parseInt(sellTaxBps) > 0) {
+    logger.warn(`  Token has sell tax: ${(parseInt(sellTaxBps) / 100).toFixed(1)}%`);
+  }
+
+  // 3. Send transaction
+  logger.info('Sending swap transaction...');
+  const txRequest = {
+    to: quote.transaction.to,
+    data: quote.transaction.data,
+    value: BigInt(quote.transaction.value),
+    gasLimit: quote.transaction.gas ? parseInt(quote.transaction.gas) : config.gasLimit,
+  };
+
+  if (gasSettings?.gasPrice) {
+    txRequest.gasPrice = gasSettings.gasPrice;
+  }
+
+  const tx = await wallet.sendTransaction(txRequest);
+  logger.info(`  TX Hash: ${tx.hash}`);
+  logger.info('Waiting for confirmation...');
+
+  // 4. Wait for confirmation
+  const receipt = await tx.wait();
+
+  if (receipt.status === 0) {
+    const error = new Error('Transaction reverted on-chain');
+    error.txHash = tx.hash;
+    throw error;
+  }
+
+  logger.success('Swap confirmed!');
+  logger.info(`  Block: ${receipt.blockNumber}`);
+  logger.info(`  Gas used: ${receipt.gasUsed.toString()}`);
+
+  return {
+    hash: tx.hash,
+    buyAmount: quote.buyAmount,
+    minBuyAmount: quote.minBuyAmount,
+    route: quote.route,
+  };
 }
 
-module.exports = { getQuote, executeBuy, applySlippage, ROUTER_ABI, SWAP_DEADLINE_SEC };
+module.exports = { getQuote, executeBuy, formatRoute, ZEROX_HEADERS };

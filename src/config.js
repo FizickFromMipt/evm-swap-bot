@@ -7,6 +7,8 @@ const PANCAKE_ROUTER = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
 const PANCAKE_FACTORY = '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73';
 
 const WBNB = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
+
+const NATIVE_TOKEN = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
 const USDT = '0x55d398326f99059fF775485246999027B3197955';
 const USDC = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
 const BUSD = '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56';
@@ -126,9 +128,12 @@ function loadConfig() {
   const minLiquidityUsd = parseFloat(process.env.MIN_LIQUIDITY_USD || '1000');
   const maxTokenAgeSec = parseInt(process.env.MAX_TOKEN_AGE_SEC || '300', 10);
   const pollIntervalMs = parseInt(process.env.POLL_INTERVAL_MS || '3000', 10);
+  const routerZeroxApiKey = process.env.ROUTER_ZERO_X_API_KEY;
+  const zeroxApiUrl = process.env.ZEROX_API_URL || 'https://api.0x.org';
 
   const errors = [];
   if (!rpcUrl) errors.push('RPC_URL is required in .env');
+  if (!routerZeroxApiKey) errors.push('ROUTER_ZERO_X_API_KEY is required in .env');
   if (!buyAmountBnb || isNaN(parseFloat(buyAmountBnb))) {
     errors.push('BUY_AMOUNT_BNB must be a valid number in .env');
   } else if (parseFloat(buyAmountBnb) <= 0) {
@@ -173,6 +178,7 @@ function loadConfig() {
   }
 
   const buyAmountWei = bnbToWei(buyAmountBnb);
+  const slippageBps = Math.round(slippagePercent * 100);
 
   return createSafeConfig({
     rpcUrl,
@@ -180,6 +186,7 @@ function loadConfig() {
     buyAmountBnb,
     buyAmountWei,
     slippagePercent,
+    slippageBps,
     gasLimit,
     maxGasPriceGwei,
     buyRetries,
@@ -190,9 +197,11 @@ function loadConfig() {
     maxTokenAgeSec,
     pollIntervalMs,
     dexscreenerApi: DEXSCREENER_API,
-    pancakeRouter: PANCAKE_ROUTER,
     pancakeFactory: PANCAKE_FACTORY,
     wbnb: WBNB,
+    routerZeroxApiKey,
+    zeroxApiUrl,
+    nativeToken: NATIVE_TOKEN,
   });
 }
 
@@ -207,5 +216,6 @@ module.exports = {
   USDT,
   USDC,
   BUSD,
+  NATIVE_TOKEN,
   DEXSCREENER_API,
 };

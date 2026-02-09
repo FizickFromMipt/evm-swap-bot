@@ -9,10 +9,25 @@ const LIQUID_QUOTES = {
   [BUSD.toLowerCase()]: { symbol: 'BUSD', tier: 2 },
 };
 
-// --- Trusted DEXes on BSC ---
+// --- Trusted DEXes on BSC (V2, V3, V4 and other major protocols) ---
 const TRUSTED_DEXES = new Set([
   'pancakeswap',
+  'pancakeswap-v3',
+  'pancakeswap-v4',
   'biswap',
+  'biswap-v3',
+  'uniswap-v3',
+  'uniswap-v4',
+  'sushiswap',
+  'sushiswap-v3',
+  'thena',
+  'thena-v3',
+  'dodo',
+  'apeswap',
+  'mdex',
+  'bakeryswap',
+  'ellipsis',
+  'wombat',
 ]);
 
 /**

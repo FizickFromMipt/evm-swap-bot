@@ -1,13 +1,13 @@
 # BSC Token Buyer CLI Bot
 
-CLI-бот для покупки токенов на BSC (BNB Smart Chain) через PancakeSwap V2 Router. Включает on-chain валидацию ERC20 токенов, anti-scam проверки (honeypot, proxy, ownership), анализ пулов через DexScreener и механизмы безопасности транзакций.
+CLI-бот для покупки токенов на BSC (BNB Smart Chain) через 0x Swap API v2 (агрегатор 50+ DEX). Включает on-chain валидацию ERC20 токенов, anti-scam проверки (honeypot, proxy, ownership), анализ пулов через DexScreener и механизмы безопасности транзакций.
 
 ## Установка
 
 ```bash
 npm install
 cp .env.example .env
-# Заполните .env — RPC URL и приватный ключ
+# Заполните .env — RPC URL, приватный ключ, 0x API key
 ```
 
 ### Переменные окружения
@@ -17,11 +17,13 @@ cp .env.example .env
 | `RPC_URL` | Да | — | BSC RPC endpoint (например `https://bsc-dataseed.binance.org/`) |
 | `PRIVATE_KEY` | Да* | — | Hex-строка (с или без `0x` префикса) |
 | `PRIVATE_KEY_PATH` | Да* | — | Путь к файлу ключа (альтернатива `PRIVATE_KEY`) |
+| `ROUTER_ZERO_X_API_KEY` | Да | — | API ключ 0x (получить на https://0x.org/docs/introduction/getting-started) |
+| `ZEROX_API_URL` | Нет | `https://api.0x.org` | Базовый URL 0x API |
 | `BUY_AMOUNT_BNB` | Да | — | Сколько BNB тратить на покупку |
-| `SLIPPAGE_PERCENT` | Нет | `5` | Проскальзывание в процентах |
-| `GAS_LIMIT` | Нет | `300000` | Gas limit для swap транзакции |
+| `SLIPPAGE_PERCENT` | Нет | `5` | Проскальзывание в процентах (конвертируется в bps для 0x API) |
+| `GAS_LIMIT` | Нет | `300000` | Fallback gas limit (0x API обычно возвращает свой) |
 | `MAX_GAS_PRICE_GWEI` | Нет | `5` | Максимальная цена газа в gwei (safety cap) |
-| `BUY_RETRIES` | Нет | `3` | Количество повторов при ошибке транзакции |
+| `BUY_RETRIES` | Нет | `3` | Количество повторов при ошибке получения котировки |
 | `BUY_RETRY_DELAY_MS` | Нет | `500` | Задержка между повторами в мс |
 | `SIMULATE_BEFORE_BUY` | Нет | `false` | Симулировать swap перед покупкой |
 | `MAX_BUY_BNB` | Нет | `1` | Максимум BNB на одну покупку (safety cap) |
@@ -70,10 +72,10 @@ npm start --continuous
  4. Gas Price             -> Получение текущей цены газа, применение cap из конфига
  5. On-chain Validation   -> Чтение ERC20 контракта (name, symbol, decimals, totalSupply)
  6. Pool Analysis         -> DexScreener API -> фильтрация и скоринг пулов
- 7. Anti-Scam Checks      -> Honeypot simulation, proxy detection, ownership check
+ 7. Anti-Scam Checks      -> Honeypot simulation (0x /price), proxy detection, ownership check
  8. Confirmation          -> Сводка для пользователя, подтверждение
- 9. Execute Swap          -> PancakeSwap V2 Router swap с retry логикой
-10. Result                -> TX hash + ссылка на BscScan
+ 9. Execute Swap          -> 0x Swap API /quote → wallet.sendTransaction() с retry логикой
+10. Result                -> TX hash + ссылка на BscScan + route info (какие DEX)
 ```
 
 ### Почему каждый шаг важен
@@ -93,18 +95,18 @@ npm start --continuous
 Затем применяет композитный скоринг (liquidity, volume, turnover, quote quality, tx activity) и выбирает лучший пул.
 
 **Шаг 7 — Anti-Scam Checks**: Три независимые проверки:
-- **Honeypot simulation**: Запрашивает `getAmountsOut` для пути BNB→Token→BNB. Если обратный swap (sell) не возможен или теряет >50% — критический риск. >20% — высокий риск.
+- **Honeypot simulation**: Запрашивает 0x `/price` для пути BNB→Token и Token→BNB. Если обратный swap (sell) не возможен или теряет >50% — критический риск. >20% — высокий риск. 0x API также предоставляет `tokenMetadata.buyToken.sellTaxBps` — встроенную детекцию sell tax.
 - **EIP-1967 Proxy Detection**: Читает storage slot `0x360894...`. Если установлен — контракт upgradeable, владелец может изменить логику.
 - **Ownership Check**: Вызывает `owner()`. Если owner != `address(0)` — ownership не renounced, владелец может иметь привилегии.
 
-**Шаг 9 — Execute Swap**: Вызывает `swapExactETHForTokensSupportingFeeOnTransferTokens` на PancakeSwap V2 Router. Использует `SupportingFeeOnTransfer` вариант для безопасной работы с дефляционными/tax токенами. При ошибке повторяет до `BUY_RETRIES` раз (не повторяет on-chain revert). Deadline: 5 минут.
+**Шаг 9 — Execute Swap**: Запрашивает 0x Swap API `/quote` — агрегатор находит лучший маршрут через 50+ DEX на BSC (PancakeSwap, BiSwap, DODO, SushiSwap и др.), включая split-routing и multi-hop. Ответ содержит готовый calldata — бот вызывает `wallet.sendTransaction({ to, data, value })`. Slippage передаётся через `slippageBps` параметр в запросе. При ошибке повторяет до `BUY_RETRIES` раз (не повторяет on-chain revert).
 
 ## Архитектура
 
 ```
 src/
 ├── index.js          Главная точка входа, оркестрация потока, CLI парсинг
-├── config.js         Загрузка .env, ethers.Wallet, bnbToWei(), BSC константы
+├── config.js         Загрузка .env, ethers.Wallet, bnbToWei(), BSC и 0x константы
 ├── validate.js       Валидация EVM адресов (ethers.isAddress)
 ├── http.js           Общий axios instance с keep-alive agents
 ├── retry.js          Экспоненциальный backoff для transient ошибок
@@ -113,17 +115,17 @@ src/
 ├── poolSelector.js   Фильтрация, скоринг и ранжирование BSC пулов
 ├── onchain.js        On-chain ERC20 чтение (name, symbol, decimals, totalSupply)
 ├── fees.js           Получение gas price через provider.getFeeData()
-├── swap.js           PancakeSwap V2 Router swap с retry логикой
-└── antiscam.js       Honeypot simulation, proxy detection, ownership check
+├── swap.js           0x Swap API v2 — получение котировки и исполнение swap
+└── antiscam.js       Honeypot simulation (0x /price), proxy detection, ownership check
 ```
 
 ### Ключевые архитектурные решения
 
-**PancakeSwap V2 Router напрямую.** Бот взаимодействует с Router контрактом (`0x10ED43C718714eb63d5aA57B78B54704E256024E`) через ethers.Contract. Путь свопа: `[WBNB, tokenAddress]`. Без посредников и агрегаторов — прямой on-chain swap.
+**0x Swap API v2 агрегатор.** Бот использует 0x API для поиска лучшего маршрута через 50+ DEX на BSC (PancakeSwap, BiSwap, DODO, SushiSwap и др.). Агрегатор автоматически находит оптимальный путь, включая split-routing (разделение ордера между DEX) и multi-hop (промежуточные токены). Не требуется `ethers.Contract` — 0x API возвращает готовый calldata.
 
-**`SupportingFeeOnTransferTokens` вариант.** Обычный `swapExactETHForTokens` упадёт на дефляционных токенах (когда фактически полученная сумма меньше ожидаемой из-за tax). Вариант `SupportingFeeOnTransfer` учитывает это.
+**Native BNB = `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`.** 0x API использует специальный адрес для native токена. Approve не нужен при свопе из BNB.
 
-**Honeypot = roundtrip simulation.** Запрашиваем `getAmountsOut` для buy (BNB→Token) и sell (Token→BNB). Если sell quote не возможен — honeypot. Если round-trip loss экстремальный — скрытый tax.
+**Honeypot = roundtrip simulation через 0x /price.** Запрашиваем котировку для buy (BNB→Token) и sell (Token→BNB). Если sell quote не возможен — honeypot. Если round-trip loss экстремальный — скрытый tax. Бонус: `tokenMetadata.buyToken.sellTaxBps` — 0x API предоставляет встроенную детекцию sell tax.
 
 **EIP-1967 proxy detection.** Читаем storage slot `0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc`. Если не нулевой — контракт является upgradeable proxy, владелец может изменить логику в любой момент.
 
@@ -131,7 +133,7 @@ src/
 
 **Приватный ключ никогда не сериализуется.** `createSafeConfig()` переопределяет `toJSON()` и `util.inspect` чтобы редактировать wallet. Даже если config случайно залогирован, виден только адрес кошелька.
 
-**ethers v6 с нативными BigInt.** Все суммы (wei, gas, amounts) — BigInt. Slippage рассчитывается через bps (basis points) для поддержки дробных процентов.
+**ethers v6 с нативными BigInt.** Все суммы (wei, gas, amounts) — BigInt. Slippage конвертируется из процентов в bps (basis points) и передаётся напрямую в 0x API.
 
 ## Exit Codes
 
@@ -155,6 +157,7 @@ src/
 ```
 TX Hash: 0x...
 BscScan: https://bscscan.com/tx/0x...
+Route: PancakeSwap_V2 (60%) + DODO (40%)
 ```
 
 При провале свопа:
@@ -179,20 +182,20 @@ npx jest --coverage
 
 | Suite | Что покрывает |
 |---|---|
-| `config.test.js` | bnbToWei, loadConfig, валидация конфига, safe serialization |
+| `config.test.js` | bnbToWei, loadConfig, валидация конфига (включая ROUTER_ZERO_X_API_KEY), slippageBps, safe serialization |
 | `validate.test.js` | Валидация EVM адресов (ethers.isAddress) |
 | `retry.test.js` | Exponential backoff, retryable vs non-retryable ошибки |
 | `dexscreener.test.js` | Парсинг API ответов, фильтрация по BSC chain |
 | `poolSelector.test.js` | Фильтрация пулов, композитный скоринг, ранжирование |
 | `onchain.test.js` | ERC20 getTokenInfo, обработка ошибок контракта |
 | `fees.test.js` | Gas price fetch, cap при превышении лимита |
-| `swap.test.js` | PancakeSwap quote, slippage, swap execution, revert handling |
-| `antiscam.test.js` | Honeypot simulation, proxy detection, ownership check, risk levels |
+| `swap.test.js` | 0x API quote, swap execution, liquidity check, route formatting |
+| `antiscam.test.js` | Honeypot simulation (0x /price), proxy detection, ownership check, risk levels |
 | `integration.test.js` | CLI parseArgs, EXIT codes |
 
 ## Безопасность
 
-- **Никогда** не коммитьте `.env` с приватным ключом
+- **Никогда** не коммитьте `.env` с приватным ключом или API ключом
 - Используйте `PRIVATE_KEY_PATH` с `chmod 600` для лучшей защиты ключа
 - Бот предупреждает если `.env` файл читаем другими (Unix)
 - Начинайте с малых сумм (`BUY_AMOUNT_BNB=0.001`) и `--dry-run`
