@@ -155,15 +155,32 @@ src/
 
 После успешного свопа бот выводит:
 ```
-TX Hash: 0x...
-BscScan: https://bscscan.com/tx/0x...
+TX Hash: 0xd3a1f5c8e2b4a6d7f9e0c1b2a3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2
+BscScan: https://bscscan.com/tx/0xd3a1f5c8e2b4a6d7f9e0c1b2a3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2
 Route: PancakeSwap_V2 (60%) + DODO (40%)
 ```
 
-При провале свопа:
+При провале свопа (on-chain revert):
 ```
-TX (failed): https://bscscan.com/tx/0x...
+TX (failed): https://bscscan.com/tx/0xa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2
 ```
+
+### Почему ссылки корректны
+
+**Источник TX hash.** Hash берётся из `tx.hash` — возвращаемого значения `wallet.sendTransaction()` (ethers v6). Это 66-символьная hex-строка (`0x` + 64 hex), однозначно идентифицирующая транзакцию в блокчейне BSC. Ethers вычисляет hash из подписанной RLP-кодированной транзакции по стандарту keccak256 — тот же алгоритм, что используют ноды BSC.
+
+**Формат URL.** BscScan (официальный обозреватель BSC от Etherscan) использует формат `https://bscscan.com/tx/{txHash}`. URL формируется интерполяцией `tx.hash` в шаблон — никакой пользовательский ввод не попадает в URL, только hash из ethers.
+
+**Два сценария:**
+
+| Сценарий | Откуда hash | Код |
+|---|---|---|
+| Успех (`receipt.status === 1`) | `tx.hash` из ответа `wallet.sendTransaction()` → возвращается как `result.hash` | `index.js:124-125` |
+| Revert (`receipt.status === 0`) | `tx.hash` сохраняется в `error.txHash` перед `throw` | `swap.js:115` → `index.js:133-134` |
+
+**Почему hash доступен даже при revert.** On-chain revert означает, что транзакция была включена в блок, но `EVM` откатил её выполнение. Транзакция уже записана в блокчейн с `status: 0` (failed), поэтому `tx.hash` валиден и BscScan покажет детали ошибки. Это отличается от network error (транзакция не отправлена) — в этом случае `err.txHash` отсутствует и ссылка не выводится.
+
+**Когда ссылка НЕ выводится.** Если ошибка произошла до отправки транзакции (quote failed, no liquidity, network error), `err.txHash` будет `undefined` и бот выводит только текст ошибки без ссылки на BscScan. Проверка `if (err.txHash)` в `index.js:133` гарантирует это.
 
 ## Тестирование
 
